@@ -1,0 +1,66 @@
+# Bipartite HyperVAE Configuration for 1650Ti (4GB VRAM)
+model:
+  # Dimensions (memory-optimized)
+  particle_hidden: 64
+  edge_hidden: 48
+  hyperedge_hidden: 32
+  latent_dim: 128
+  attention_heads: 4
+  max_particles: 150
+  particle_features: 3  # pt, eta, phi (no mass)
+  
+  # Architecture
+  encoder:
+    particle_lgat_layers: 3
+    edge_transformer_layers: 2
+    hyperedge_lgat_layers: 2
+    dropout: 0.1
+  
+  decoder:
+    mlp_layers: 3
+    dropout: 0.1
+    use_gumbel_softmax: true
+    gumbel_temperature: 1.0
+
+# Training
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 4  # Effective batch size = 32
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  epochs: 300  # More epochs for small dataset
+  warmup_epochs: 20
+  gradient_clip: 1.0
+  mixed_precision: true  # FP16 for memory efficiency
+  
+  # Loss weights (adjusted for better balance)
+  loss_weights:
+    particle_features: 1.0  # Reduced - features are large scale
+    edge_features: 0.5
+    hyperedge_features: 0.3
+    topology: 0.1
+    kl_divergence: 0.00001  # Much smaller - was exploding
+  
+  # KL annealing (slower warmup for stability)
+  kl_warmup_epochs: 100  # Increased from 50
+  kl_max_weight: 0.0001  # Cap maximum KL weight
+  
+# Data
+data:
+  num_workers: 2
+  pin_memory: true
+  prefetch_factor: 2
+  
+  # Features
+  particle_features: 3  # pt, eta, phi
+  edge_features: 5  # ln_delta, ln_kt, ln_z, ln_m2, feat5
+  hyperedge_features: 2  # 3pt_eec, 4pt_eec
+  jet_types: 3  # quark, gluon, top
+
+# Evaluation
+evaluation:
+  sample_size: 1000
+  metrics:
+    - wasserstein_distance
+    - structure_metrics
+    - physics_constraints
