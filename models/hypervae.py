@@ -329,6 +329,10 @@ class BipartiteHyperVAE(nn.Module):
             Auxiliary losses (edges/hyperedges) only computed during training.
             This saves computation during validation/inference.
         """
+        # Fix batch.y shape if needed (PyG concatenates [4] tensors into [batch_size*4])
+        if batch.y.dim() == 1 and hasattr(batch, 'num_graphs'):
+            batch.y = batch.y.view(batch.num_graphs, -1)  # [batch_size, 4]
+        
         losses = {}
         
         # === 1. PARTICLE RECONSTRUCTION LOSS (MAIN LOSS) ===
@@ -348,7 +352,7 @@ class BipartiteHyperVAE(nn.Module):
                 edge_loss = self._edge_reconstruction_loss(batch, output['edge_features'])
                 losses['edge'] = edge_loss
             else:
-                losses['edge'] = torch.tensor(0.0, device=batch.particle_x.device)
+                losses['edge'] = torch.tensor(0.0, device=batch.x.device)
             
             # Hyperedge feature auxiliary loss
             if output.get('hyperedge_features') is not None:
@@ -357,10 +361,10 @@ class BipartiteHyperVAE(nn.Module):
                 )
                 losses['hyperedge'] = hyperedge_loss
             else:
-                losses['hyperedge'] = torch.tensor(0.0, device=batch.particle_x.device)
+                losses['hyperedge'] = torch.tensor(0.0, device=batch.x.device)
         else:
-            losses['edge'] = torch.tensor(0.0, device=batch.particle_x.device)
-            losses['hyperedge'] = torch.tensor(0.0, device=batch.particle_x.device)
+            losses['edge'] = torch.tensor(0.0, device=batch.x.device)
+            losses['hyperedge'] = torch.tensor(0.0, device=batch.x.device)
         
         # 4. Jet feature loss (ALWAYS computed - includes N_constituents)
         # Pass topology information for N_constituents prediction
@@ -652,7 +656,7 @@ class BipartiteHyperVAE(nn.Module):
             max_particles: Maximum particles per jet in this batch
             num_features: Particle feature dimension (e.g., 4 for [E, px, py, pz])
         """
-        true_features = batch.particle_x  # [N_particles_total, num_features]
+        true_features = batch.x  # [N_particles_total, num_features]
         
         batch_size = batch.num_graphs
         total_loss = 0.0
@@ -751,7 +755,7 @@ class BipartiteHyperVAE(nn.Module):
         Returns:
             torch.Tensor: Scalar MSE loss averaged over valid jets
         """
-        true_features = batch.particle_x
+        true_features = batch.x
         
         batch_size = batch.num_graphs
         loss = 0.0
@@ -810,7 +814,7 @@ class BipartiteHyperVAE(nn.Module):
         Returns:
             torch.Tensor: Scalar Wasserstein distance averaged over features and jets
         """
-        true_features = batch.particle_x.cpu().numpy()
+        true_features = batch.x.cpu().numpy()
         pred_features_np = pred_features.cpu().numpy()
         
         batch_size = batch.num_graphs
@@ -848,7 +852,7 @@ class BipartiteHyperVAE(nn.Module):
             cumulative_particles += n_true
         
         # Convert back to tensor
-        return torch.tensor(total_loss / max(valid_count, 1), device=batch.particle_x.device)
+        return torch.tensor(total_loss / max(valid_count, 1), device=batch.x.device)
     
     def _edge_reconstruction_loss(self, batch, pred_features):
         """Edge feature loss - MSE for training, Wasserstein for evaluation"""
@@ -884,7 +888,7 @@ class BipartiteHyperVAE(nn.Module):
     
     def _hyperedge_reconstruction_loss(self, batch, pred_features, pred_mask):
         """Hyperedge feature loss - MSE for training, Wasserstein for evaluation"""
-        true_features = batch.hyperedge_x
+        true_features = batch.hyperedge_attr
         
         if true_features.size(0) == 0:
             return torch.tensor(0.0, device=pred_features.device)

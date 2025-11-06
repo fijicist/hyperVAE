@@ -10,18 +10,17 @@
 #    # OR: venv\Scripts\activate  # Windows
 #
 # 2. Install PyTorch with CUDA (if using GPU):
-#    # For CUDA 12.1 (GTX 1650 Ti compatible):
-#    pip install torch==2.2.0 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
+#    # For CUDA 12.1:
+#    pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
 #    
 #    # For CUDA 11.8:
-#    pip install torch==2.2.0 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu118
+#    pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cu118
 #    
 #    # For CPU only:
-#    pip install torch==2.2.0 torchvision==0.18.1
+#    pip install torch==2.2.0
 #
-# 3. Install PyTorch Geometric and dependencies:
+# 3. Install PyTorch Geometric:
 #    pip install torch-geometric
-#    pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 #
 # 4. Install remaining requirements:
 #    pip install -r requirements.txt
@@ -42,18 +41,9 @@
 # PyTorch: Main deep learning framework
 # Note: Install separately with CUDA support (see instructions above)
 torch>=2.2.0
-torchvision>=0.18.0
 
 # PyTorch Geometric: Graph neural network library for jet representation
 torch-geometric>=2.6.0
-
-# PyG Sparse Operations: Required for efficient graph operations
-# Note: Install via PyG wheel (see instructions above) or:
-torch-scatter>=2.1.0
-torch-sparse>=0.6.16
-torch-cluster>=1.6.0
-torch-spline-conv>=1.2.0
-pyg-lib>=0.4.0
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ L-GATr: LORENTZ-EQUIVARIANT TRANSFORMER (KEY INNOVATION)                │
@@ -94,6 +84,9 @@ energyflow>=1.3.0
 energyenergycorrelators>=2.0.0b1
 
 # JetNet: Standard jet datasets (graph_constructor.py)
+# Note: JetNet depends on coffea which requires uproot>=5.3.11
+# If you have weaver-core installed (not required for HyperVAE), you may see a dependency warning.
+# This warning can be safely ignored as long as graph_constructor.py runs successfully.
 jetnet>=0.2.5
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -162,13 +155,19 @@ networkx>=3.3
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Issue: torch-geometric installation fails
-# Solution: Install PyTorch first, then use PyG wheel matching your PyTorch/CUDA:
+# Solution: Install PyTorch first, then torch-geometric:
 #   pip install torch-geometric
-#   pip install pyg-lib torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 #
 # Issue: lgatr import error
 # Solution: Ensure you have compatible PyTorch (>=2.0) and install lgatr:
 #   pip install lgatr
+#
+# Issue: uproot version conflict with weaver-core
+# Error: "weaver-core requires uproot<5.2.0, but you have uproot 5.6.8"
+# Solution: This is expected if you have weaver-core installed separately.
+#   HyperVAE requires jetnet which needs uproot>=5.3. If weaver-core is not
+#   needed for your work, you can uninstall it: pip uninstall weaver-core
+#   Otherwise, the warning can be safely ignored as long as graph_constructor.py works.
 #
 # Issue: fastjet not found
 # Solution: Install fastjet via pip (may require compiler):

@@ -158,39 +158,47 @@ class BipartiteJetDataset(Dataset):
         else:
             hyperedge_features = torch.zeros((0, 1))  # Default to 1 feature if none
         
+        # Extract edge_index (pairwise particle edges)
+        if hasattr(data, 'edge_index') and data.edge_index is not None:
+            edge_index = data.edge_index.long()
+        else:
+            edge_index = torch.zeros((2, 0), dtype=torch.long)
+        
         # Build bipartite edge index (particle -> hyperedge)
         # hyperedge_index format: [2, N_connections] where each column is [particle_id, hyperedge_id]
         if hasattr(data, 'hyperedge_index') and data.hyperedge_index is not None:
-            edge_index_bipartite = data.hyperedge_index.long()
+            hyperedge_index = data.hyperedge_index.long()
         else:
-            edge_index_bipartite = torch.zeros((2, 0), dtype=torch.long)
+            hyperedge_index = torch.zeros((2, 0), dtype=torch.long)
         
         # Jet type and jet features
         # y tensor contains: [jet_type, jet_pt, jet_eta, jet_mass, ...]
         if hasattr(data, 'y') and data.y is not None:
             y_tensor = data.y.float() if data.y.dtype != torch.long else data.y.float()
-            if y_tensor.dim() == 1:
-                y_tensor = y_tensor.unsqueeze(0)  # [1, num_features]
+            # Keep as 1D [4] to match graph_constructor.py format
+            if y_tensor.dim() > 1:
+                y_tensor = y_tensor.squeeze(0)  # [4]
             
             # Extract jet_type (first element, convert to long)
-            jet_type = y_tensor[:, 0].long()
+            jet_type = torch.tensor([int(y_tensor[0].item())], dtype=torch.long)
         else:
-            y_tensor = torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float)  # Default
+            y_tensor = torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float)  # Default [4]
             jet_type = torch.tensor([0], dtype=torch.long)
         
         return {
             'particle_features': particle_features,
+            'edge_index': edge_index,  # Pairwise particle edges
             'edge_features': edge_features,
+            'hyperedge_index': hyperedge_index,  # Hyperedge connections
             'hyperedge_features': hyperedge_features,
-            'edge_index_bipartite': edge_index_bipartite,
             'jet_type': jet_type,
-            'y': y_tensor,  # Full y tensor with jet features
+            'y': y_tensor,  # [4] tensor: [jet_type, log(pt), eta, log(mass)]
             'n_particles': particle_features.shape[0],
             'n_hyperedges': hyperedge_features.shape[0]
         }
     
     def _generate_dummy_data(self, num_samples):
-        """Generate dummy jet data for testing (matching your .pt format)"""
+        """Generate dummy jet data for testing (matching graph_constructor.py format)"""
         print(f"Generating {num_samples} dummy jet samples...")
         data = []
         
@@ -198,55 +206,69 @@ class BipartiteJetDataset(Dataset):
             # Random number of particles (15-50 typical for jets)
             n_particles = np.random.randint(15, 50)
             
-            # Particle features (pt, eta, phi) - no mass
-            pt = np.random.exponential(20, n_particles).astype(np.float32)
-            eta = np.random.uniform(-2.5, 2.5, n_particles).astype(np.float32)
-            phi = np.random.uniform(-np.pi, np.pi, n_particles).astype(np.float32)
-            particle_features = torch.from_numpy(np.stack([pt, eta, phi], axis=1))  # [N, 3]
+            # Particle 4-momentum features [E, px, py, pz] - matching graph_constructor.py
+            # Generate physically valid 4-momenta: E² = px² + py² + pz² + m²
+            px = np.random.normal(0, 10, n_particles).astype(np.float32)
+            py = np.random.normal(0, 10, n_particles).astype(np.float32)
+            pz = np.random.normal(0, 15, n_particles).astype(np.float32)
+            m = np.random.uniform(0.1, 1.0, n_particles).astype(np.float32)  # Small masses
+            E = np.sqrt(px**2 + py**2 + pz**2 + m**2)  # Satisfy energy-momentum relation
+            particle_features = torch.from_numpy(np.stack([E, px, py, pz], axis=1))  # [N, 4]
             
-            # Number of hyperedges (pairs and triplets/quadruplets)
+            # Number of edges and hyperedges
             n_edges = min(n_particles * (n_particles - 1) // 2, 200)  # Limit edges
             n_hyperedges = min(n_particles // 3, 30)  # Limit hyperedges
             
-            # Edge features (5D: ln_delta, ln_kt, ln_z, ln_m2, feat5)
+            # Edge features (5D: 2pt_EEC, ln_delta, ln_kT, ln_z, ln_m²) - matching graph_constructor.py
             edge_features = torch.randn(n_edges, 5)
             
-            # Hyperedge features (2D: 3pt_eec, 4pt_eec)
-            hyperedge_features = torch.randn(n_hyperedges, 2)
+            # Edge index (fully connected for dummy data)
+            edge_pairs = []
+            for i_p in range(min(n_particles, 20)):  # Limit for dummy data
+                for j_p in range(i_p + 1, min(n_particles, 20)):
+                    edge_pairs.append([i_p, j_p])
+            if len(edge_pairs) > 0:
+                edge_index = torch.tensor(edge_pairs[:n_edges]).T.long()  # [2, E]
+            else:
+                edge_index = torch.zeros((2, 0), dtype=torch.long)
             
-            # Bipartite graph structure
-            # Edge connections: particle -> hyperedge
-            # Randomly connect particles to hyperedges (3-4 particles per hyperedge)
-            edge_index_bipartite = []
+            # Hyperedge features (N-point EEC) - matching graph_constructor.py
+            hyperedge_features = torch.randn(n_hyperedges, 1) if n_hyperedges > 0 else torch.zeros((0, 1))
+            
+            # Hyperedge index (particle-hyperedge connections)
+            hyperedge_index_list = []
             for h_idx in range(n_hyperedges):
                 n_particles_in_hyperedge = np.random.randint(3, 5)
                 particles_in_hyperedge = np.random.choice(
                     n_particles, n_particles_in_hyperedge, replace=False
                 )
                 for p_idx in particles_in_hyperedge:
-                    edge_index_bipartite.append([p_idx, h_idx])
+                    hyperedge_index_list.append([p_idx, h_idx])
             
-            if len(edge_index_bipartite) > 0:
-                edge_index_bipartite = torch.tensor(edge_index_bipartite).T.long()
+            if len(hyperedge_index_list) > 0:
+                hyperedge_index = torch.tensor(hyperedge_index_list).T.long()
             else:
-                edge_index_bipartite = torch.zeros((2, 0), dtype=torch.long)
+                hyperedge_index = torch.zeros((2, 0), dtype=torch.long)
             
             # Jet type (0: quark, 1: gluon, 2: top)
-            jet_type = torch.tensor([i % 3], dtype=torch.long)
+            jet_type = i % 3
             
-            # Generate jet-level features: [jet_type, jet_pt, jet_eta, jet_mass]
-            jet_pt = np.sum(pt)  # Sum of particle pts
-            jet_eta = np.mean(eta)  # Average eta
+            # Generate jet-level features: [jet_type, log(pt), eta, log(mass)] - matching graph_constructor.py
+            jet_pt = np.sum(np.sqrt(px**2 + py**2))  # Sum of particle pts
+            # Compute eta safely: eta = arctanh(pz/E), clip to avoid NaN
+            pz_over_E = np.clip(pz / (E + 1e-8), -0.99, 0.99)  # Clip to valid range for arctanh
+            jet_eta = np.mean(np.arctanh(pz_over_E))  # Average eta
             jet_mass = np.random.uniform(50, 200)  # Random jet mass
-            y_tensor = torch.tensor([[jet_type.item(), jet_pt, jet_eta, jet_mass]], dtype=torch.float)
+            y_tensor = torch.tensor([jet_type, np.log(jet_pt + 1), jet_eta, np.log(jet_mass + 1)], dtype=torch.float)
             
             data.append({
                 'particle_features': particle_features,
+                'edge_index': edge_index,
                 'edge_features': edge_features,
+                'hyperedge_index': hyperedge_index,
                 'hyperedge_features': hyperedge_features,
-                'edge_index_bipartite': edge_index_bipartite,
-                'jet_type': jet_type,
-                'y': y_tensor,  # Full y tensor
+                'jet_type': torch.tensor([jet_type], dtype=torch.long),
+                'y': y_tensor,  # [4] tensor
                 'n_particles': n_particles,
                 'n_hyperedges': n_hyperedges
             })
@@ -257,29 +279,27 @@ class BipartiteJetDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx):
-        """Return PyG Data object for bipartite graph"""
+        """Return PyG Data object matching graph_constructor.py format"""
         sample = self.data[idx]
         
-        # Create bipartite graph
-        # Node features: [particles; hyperedges]
-        particle_x = sample['particle_features']
-        hyperedge_x = sample['hyperedge_features']
+        # Create data object with field names matching graph_constructor.py
+        # x: particle 4-momenta [N, 4]
+        # edge_index: edge connectivity [2, E]
+        # edge_attr: edge features [E, 5]
+        # hyperedge_index: hyperedge connectivity [2, H] (optional)
+        # hyperedge_attr: hyperedge features [K, F] (optional)
+        # y: jet features [4] - [jet_type, log(pt), eta, log(mass)]
         
-        # Pad to max_particles for batching
-        n_particles = sample['n_particles']
-        n_hyperedges = sample['n_hyperedges']
-        
-        # Create data object
         data = Data(
-            particle_x=particle_x,
-            hyperedge_x=hyperedge_x,
+            x=sample['particle_features'],  # Changed from particle_x to x
+            edge_index=sample['edge_index'],  # Changed from edge_index_bipartite
             edge_attr=sample['edge_features'],
-            edge_index=sample['edge_index_bipartite'],
-            jet_type=sample['jet_type'],
-            y=sample['y'],  # Include full y tensor
-            n_particles=torch.tensor([n_particles]),
-            n_hyperedges=torch.tensor([n_hyperedges]),
-            num_nodes=n_particles + n_hyperedges  # Total nodes in bipartite graph
+            hyperedge_index=sample.get('hyperedge_index'),  # Optional
+            hyperedge_attr=sample['hyperedge_features'],  # Changed from hyperedge_x
+            y=sample['y'],  # [4] tensor
+            jet_type=sample['jet_type'],  # Keep for backward compatibility
+            n_particles=torch.tensor([sample['n_particles']]),
+            n_hyperedges=torch.tensor([sample['n_hyperedges']])
         )
         
         return data

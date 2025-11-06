@@ -190,13 +190,13 @@ class BipartiteEncoder(nn.Module):
         max_particles = max(n_particles_list)
         
         # Reshape to batched format with padding
-        device = batch.particle_x.device
+        device = batch.x.device
         batched_fourmomenta = torch.zeros(batch_size, max_particles, 4, device=device)
         batched_mask = torch.zeros(batch_size, max_particles, dtype=torch.bool, device=device)
         
         particle_idx = 0
         for i, n_p in enumerate(n_particles_list):
-            batched_fourmomenta[i, :n_p] = batch.particle_x[particle_idx:particle_idx + n_p]
+            batched_fourmomenta[i, :n_p] = batch.x[particle_idx:particle_idx + n_p]
             batched_mask[i, :n_p] = True
             particle_idx += n_p
         
@@ -251,7 +251,7 @@ class BipartiteEncoder(nn.Module):
                                      device=particle_x.device)
         
         # 3. Encode hyperedges (no self-attention to save memory)
-        hyperedge_x = self.hyperedge_embed(batch.hyperedge_x)
+        hyperedge_x = self.hyperedge_embed(batch.hyperedge_attr)
         for layer in self.hyperedge_mlp:
             # Residual connection
             hyperedge_x = hyperedge_x + layer(hyperedge_x)
@@ -266,10 +266,17 @@ class BipartiteEncoder(nn.Module):
         jet_eta_index = self.config.get('training', {}).get('loss_config', {}).get('jet_eta_index', 2)
         jet_mass_index = self.config.get('training', {}).get('loss_config', {}).get('jet_mass_index', 3)
         
+        # PyG concatenates y tensors during batching: [4, 4, 4, ...] -> [batch_size*4]
+        # Reshape to [batch_size, 4] for proper indexing
+        y = batch.y
+        if y.dim() == 1:
+            batch_size = batch.num_graphs
+            y = y.view(batch_size, -1)  # [batch_size, 4]
+        
         jet_features = torch.stack([
-            batch.y[:, jet_pt_index],
-            batch.y[:, jet_eta_index],
-            batch.y[:, jet_mass_index]
+            y[:, jet_pt_index],
+            y[:, jet_eta_index],
+            y[:, jet_mass_index]
         ], dim=1)  # [batch_size, 3]
         
         jet_x = self.jet_embed(jet_features)
@@ -309,7 +316,7 @@ class BipartiteEncoder(nn.Module):
         for i in range(batch.num_graphs):
             n_particles = batch.n_particles[i].item()
             particle_batch.extend([i] * n_particles)
-        return torch.tensor(particle_batch, device=batch.particle_x.device)
+        return torch.tensor(particle_batch, device=batch.x.device)
     
     def _global_mean_pool(self, x, batch):
         """Global mean pooling"""
@@ -326,7 +333,7 @@ class BipartiteEncoder(nn.Module):
         for i in range(batch.num_graphs):
             n_hyperedges = batch.n_hyperedges[i].item()
             hyperedge_batch.extend([i] * n_hyperedges)
-        return torch.tensor(hyperedge_batch, device=batch.particle_x.device)
+        return torch.tensor(hyperedge_batch, device=batch.x.device)
 
 
 class BipartiteCrossAttention(nn.Module):

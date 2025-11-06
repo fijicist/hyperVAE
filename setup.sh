@@ -164,10 +164,10 @@ echo ""
 
 if [ -n "$TORCH_INDEX" ]; then
     echo "→ Installing PyTorch 2.2.0 with $TORCH_CUDA support..."
-    pip install torch==2.2.0 torchvision==0.18.1 --index-url "$TORCH_INDEX"
+    pip install torch==2.2.0 --index-url "$TORCH_INDEX"
 else
     echo "→ Installing PyTorch 2.2.0 (CPU-only)..."
-    pip install torch==2.2.0 torchvision==0.18.1
+    pip install torch==2.2.0
 fi
 
 if [ $? -eq 0 ]; then
@@ -210,25 +210,14 @@ else
 fi
 
 echo ""
-echo "→ Installing PyG extensions (scatter, sparse, cluster)..."
-
-if [ "$TORCH_CUDA" != "cpu" ]; then
-    # Install CUDA-enabled extensions
-    PYG_WHEEL="https://data.pyg.org/whl/torch-2.2.0+${TORCH_CUDA}.html"
-    echo "  Using PyG wheel: $PYG_WHEEL"
-    pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv -f "$PYG_WHEEL"
-else
-    # Install CPU-only extensions
-    pip install pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv
-fi
+echo "→ Installing torch-geometric..."
+pip install torch-geometric
 
 if [ $? -eq 0 ]; then
-    echo ""
-    echo "  ✓ PyG extensions installed"
+    echo "  ✓ torch-geometric installed"
 else
-    echo ""
-    echo "  ⚠ Some PyG extensions may have failed (this is sometimes OK)"
-    echo "    Will try to continue..."
+    echo "  ✗ torch-geometric installation failed"
+    exit 1
 fi
 
 echo ""
