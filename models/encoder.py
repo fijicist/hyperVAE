@@ -1,7 +1,41 @@
+"""
+═══════════════════════════════════════════════════════════════════════════════
+ENCODER - BIPARTITE HYPERGRAPH TO VAE LATENT SPACE
+═══════════════════════════════════════════════════════════════════════════════
+
+Encodes jets (represented as bipartite hypergraphs) into VAE latent space.
+
+Architecture:
+-------------
+    Particles [N, 4] → L-GATr → Scalars [N, hidden_s]
+    Edges [M, 5] → MLP → [M, edge_hidden]
+    Hyperedges [K, features] → MLP → [K, hyperedge_hidden]
+                    ↓
+              Cross-Attention (particles ↔ hyperedges)
+                    ↓
+            Global Pooling (mean over particles/edges/hyperedges)
+                    ↓
+            Fusion MLP → μ, log(σ²) (latent dim)
+
+Key Components:
+---------------
+1. L-GATr Particle Encoder: Lorentz-equivariant processing of 4-momenta
+2. Edge/Hyperedge MLPs: Process graph structure information
+3. Cross-Attention: Fuses particle-level and hyperedge-level information
+4. Global Pooling: Aggregates variable-length inputs to fixed-size latent
+5. Latent Projection: Maps to VAE latent space (μ, logvar for reparameterization)
+
+Outputs:
+--------
+mu: [batch_size, latent_dim] - Mean of latent distribution
+logvar: [batch_size, latent_dim] - Log-variance of latent distribution
+
+These are used for VAE reparameterization: z = μ + σ * ε, where ε ~ N(0, I)
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .lgat_layers import LGATrLayer, EdgeAwareTransformerConv
+from .lgatr_wrapper import LGATrParticleEncoder
 
 
 class BipartiteEncoder(nn.Module):
@@ -9,9 +43,9 @@ class BipartiteEncoder(nn.Module):
     Encoder for bipartite hypergraph VAE.
     
     Architecture:
-    1. Particle embedding (4D) -> L-GATr blocks (3 layers)
-    2. Edge embedding (5D) -> Edge-aware transformer (2 layers)
-    3. Hyperedge embedding (2D) -> L-GATr blocks (2 layers)
+    1. Particle embedding (configurable dims) -> L-GATr blocks
+    2. Edge embedding (configurable dims) -> Edge-aware transformer
+    3. Hyperedge embedding (configurable dims) -> MLP blocks
     4. Bipartite cross-attention -> Fusion MLP -> Latent (μ, σ²)
     """
     
@@ -20,41 +54,55 @@ class BipartiteEncoder(nn.Module):
         self.config = config
         
         # Dimensions
-        particle_hidden = config['particle_hidden']
         edge_hidden = config['edge_hidden']
         hyperedge_hidden = config['hyperedge_hidden']
         latent_dim = config['latent_dim']
-        num_heads = config['attention_heads']
         dropout = config['encoder']['dropout']
         
-        # 1. Particle encoder
-        particle_features = config.get('particle_features', 3)  # Default to 3 (pt, eta, phi)
-        self.particle_embed = nn.Sequential(
-            nn.Linear(particle_features, particle_hidden),  # pt, eta, phi
-            nn.LayerNorm(particle_hidden),
-            nn.GELU()
-        )
+        # 1. Particle encoder using official L-GATr library
+        # L-GATr handles particle embedding internally, outputs scalars for latent projection
+        self.particle_encoder = LGATrParticleEncoder(config)
+        particle_output_dim = self.particle_encoder.get_output_dim()  # Get scalar output dimension
         
-        self.particle_lgat = nn.ModuleList([
-            LGATrLayer(particle_hidden, num_heads, dropout)
-            for _ in range(config['encoder']['particle_lgat_layers'])
-        ])
+        # If L-GATr outputs scalars, use them; otherwise will need to extract from 4-vectors
+        if particle_output_dim == 0:
+            # L-GATr outputs only 4-vectors, need to convert to scalars for latent
+            # Use a simple projection from 4D to hidden dim
+            particle_features = config.get('particle_features', 4)
+            particle_output_dim = config.get('particle_hidden', 128)  # Fallback for pooling
+            self.particle_to_scalar = nn.Sequential(
+                nn.Linear(particle_features, particle_output_dim),
+                nn.LayerNorm(particle_output_dim),
+                nn.GELU()
+            )
+        else:
+            self.particle_to_scalar = None
         
-        # 2. Edge encoder
+        # 2. Edge encoder with residual connections
+        edge_features = config.get('edge_features', 5)  # Configurable (default: 5)
         self.edge_embed = nn.Sequential(
-            nn.Linear(5, edge_hidden),  # 5 edge features
+            nn.Linear(edge_features, edge_hidden),
             nn.LayerNorm(edge_hidden),
             nn.GELU()
         )
         
-        self.edge_transformer = nn.ModuleList([
-            EdgeAwareTransformerConv(edge_hidden, edge_hidden, edge_dim=5, num_heads=num_heads, dropout=dropout)
-            for _ in range(config['encoder']['edge_transformer_layers'])
+        # Edge MLP layers with residual connections
+        self.edge_mlp = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(edge_hidden, edge_hidden * 2),
+                nn.LayerNorm(edge_hidden * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(edge_hidden * 2, edge_hidden),
+                nn.Dropout(dropout)
+            )
+            for _ in range(config['encoder'].get('edge_layers', config['encoder'].get('edge_transformer_layers', 3)))
         ])
         
         # 3. Hyperedge encoder (memory-efficient - no self-attention for large hyperedge sets)
+        hyperedge_features = config.get('hyperedge_features', 2)  # Configurable (default: 2)
         self.hyperedge_embed = nn.Sequential(
-            nn.Linear(2, hyperedge_hidden),  # 3pt_eec, 4pt_eec
+            nn.Linear(hyperedge_features, hyperedge_hidden),
             nn.LayerNorm(hyperedge_hidden),
             nn.GELU()
         )
@@ -69,25 +117,54 @@ class BipartiteEncoder(nn.Module):
                 nn.Linear(hyperedge_hidden * 2, hyperedge_hidden),
                 nn.Dropout(dropout)
             )
-            for _ in range(config['encoder']['hyperedge_lgat_layers'])
+            for _ in range(config['encoder'].get('hyperedge_layers', config['encoder'].get('hyperedge_lgat_layers', 2)))
         ])
         
-        # 4. Bipartite cross-attention
-        self.cross_attention = BipartiteCrossAttention(
-            particle_hidden, hyperedge_hidden, num_heads, dropout
+        # 4. Jet-level feature encoder with residual connections
+        jet_features = config.get('jet_features', 3)  # Configurable (default: 3)
+        jet_hidden = config.get('jet_hidden', latent_dim)  # Use jet_hidden from config
+        self.jet_embed = nn.Sequential(
+            nn.Linear(jet_features, jet_hidden),
+            nn.LayerNorm(jet_hidden),
+            nn.GELU()
         )
         
-        # 5. Fusion and latent projection
-        fusion_dim = particle_hidden + hyperedge_hidden + edge_hidden
+        # Jet MLP layers with residual connections
+        self.jet_mlp = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(jet_hidden, jet_hidden * 2),
+                nn.LayerNorm(jet_hidden * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(jet_hidden * 2, jet_hidden),
+                nn.Dropout(dropout)
+            )
+            for _ in range(config['encoder'].get('jet_layers', 2))
+        ])
+        
+        # 5. Bipartite cross-attention (use particle_output_dim instead of particle_hidden)
+        num_heads = config.get('attention_heads', 4)  # Keep for backward compatibility
+        self.cross_attention = BipartiteCrossAttention(
+            particle_output_dim, hyperedge_hidden, num_heads, dropout
+        )
+        
+        # 6. Fusion and latent projection with pre-projection for residual
+        fusion_dim = particle_output_dim + hyperedge_hidden + edge_hidden + jet_hidden
+        
+        # Project fused features to latent_dim*2 for residual connection
+        self.fusion_pre_proj = nn.Linear(fusion_dim, latent_dim * 2)
+        
+        # Main fusion MLP
         self.fusion_mlp = nn.Sequential(
-            nn.Linear(fusion_dim, latent_dim * 2),
+            nn.Linear(latent_dim * 2, latent_dim * 2),
             nn.LayerNorm(latent_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(latent_dim * 2, latent_dim * 2)
         )
         
-        # Latent parameters
+        # Latent parameters with layer norm for stability
+        self.latent_norm = nn.LayerNorm(latent_dim * 2)
         self.mu_proj = nn.Linear(latent_dim * 2, latent_dim)
         self.logvar_proj = nn.Linear(latent_dim * 2, latent_dim)
     
@@ -95,29 +172,64 @@ class BipartiteEncoder(nn.Module):
         """
         Args:
             batch: PyG Batch object with:
-                - particle_x: [N_particles, 4]
-                - hyperedge_x: [N_hyperedges, 2]
+                - particle_x: [N_particles, 4] - 4-vectors [E, px, py, pz]
+                - hyperedge_x: [N_hyperedges, 1 or 2]
                 - edge_attr: [N_edges, 5]
                 - edge_index: [2, N_edges]
                 - batch: Batch assignment
         """
-        # 1. Encode particles
-        particle_x = self.particle_embed(batch.particle_x)
-        for layer in self.particle_lgat:
-            particle_x = layer(particle_x)
+        # 1. Encode particles with official L-GATr
+        # Need to convert PyG flat format [N_particles, 4] to batched [batch_size, max_particles, 4]
         
-        # Create particle batch index
+        # Create particle batch index first to determine structure
         particle_batch = self._create_particle_batch(batch)
+        batch_size = batch.num_graphs
+        
+        # Find max particles in this batch for padding
+        n_particles_list = batch.n_particles.tolist()
+        max_particles = max(n_particles_list)
+        
+        # Reshape to batched format with padding
+        device = batch.particle_x.device
+        batched_fourmomenta = torch.zeros(batch_size, max_particles, 4, device=device)
+        batched_mask = torch.zeros(batch_size, max_particles, dtype=torch.bool, device=device)
+        
+        particle_idx = 0
+        for i, n_p in enumerate(n_particles_list):
+            batched_fourmomenta[i, :n_p] = batch.particle_x[particle_idx:particle_idx + n_p]
+            batched_mask[i, :n_p] = True
+            particle_idx += n_p
+        
+        # Pass through L-GATr encoder
+        lgatr_output = self.particle_encoder(batched_fourmomenta, mask=batched_mask)
+        
+        # Extract features - need to flatten back to [N_particles, features] for pooling
+        if lgatr_output['scalars'] is not None:
+            # L-GATr outputs scalar features [batch_size, max_particles, out_s_channels]
+            particle_x_batched = lgatr_output['scalars']
+        else:
+            # L-GATr only outputs 4-vectors, project to scalars
+            particle_x_batched = self.particle_to_scalar(lgatr_output['fourmomenta'])
+        
+        # Flatten back to [N_particles, features] for subsequent processing
+        particle_x = []
+        for i, n_p in enumerate(n_particles_list):
+            particle_x.append(particle_x_batched[i, :n_p])
+        particle_x = torch.cat(particle_x, dim=0)  # [N_particles, features]
         
         # Pool particles per graph
         particle_pooled = self._global_mean_pool(particle_x, particle_batch)
         
-        # 2. Encode edges (if present)
+        # 2. Encode edges with residual connections (if present)
         if batch.edge_attr.size(0) > 0:
             # Embed edge features
             edge_x = self.edge_embed(batch.edge_attr)  # [E, edge_hidden]
             
-            # Simple mean pooling of edges per graph
+            # Apply MLP layers with residual connections
+            for layer in self.edge_mlp:
+                edge_x = edge_x + layer(edge_x)  # Residual connection
+            
+            # Mean pooling of edges per graph
             edge_pooled = torch.zeros(batch.num_graphs, self.config['edge_hidden'], device=edge_x.device)
             cumulative_particles = 0
             cumulative_edges = 0
@@ -148,16 +260,46 @@ class BipartiteEncoder(nn.Module):
         hyperedge_batch = self._create_hyperedge_batch(batch)
         hyperedge_pooled = self._global_mean_pool(hyperedge_x, hyperedge_batch)
         
-        # 4. Cross-attention between particles and hyperedges
+        # 4. Encode jet-level features with residual connections
+        # Extract jet features from y tensor: [jet_pt, jet_eta, jet_mass]
+        jet_pt_index = self.config.get('training', {}).get('loss_config', {}).get('jet_pt_index', 1)
+        jet_eta_index = self.config.get('training', {}).get('loss_config', {}).get('jet_eta_index', 2)
+        jet_mass_index = self.config.get('training', {}).get('loss_config', {}).get('jet_mass_index', 3)
+        
+        jet_features = torch.stack([
+            batch.y[:, jet_pt_index],
+            batch.y[:, jet_eta_index],
+            batch.y[:, jet_mass_index]
+        ], dim=1)  # [batch_size, 3]
+        
+        jet_x = self.jet_embed(jet_features)
+        for layer in self.jet_mlp:
+            # Residual connection
+            jet_x = jet_x + layer(jet_x)
+        
+        # 5. Cross-attention between particles and hyperedges
         cross_features = self.cross_attention(particle_pooled, hyperedge_pooled)
         
-        # 5. Fusion
-        fused = torch.cat([particle_pooled, hyperedge_pooled, edge_pooled], dim=-1)
-        fused = self.fusion_mlp(fused)
+        # 6. Fusion with residual connection (now includes jet features)
+        fused = torch.cat([particle_pooled, hyperedge_pooled, edge_pooled, jet_x], dim=-1)
+        fused_proj = self.fusion_pre_proj(fused)  # Project to latent_dim*2
+        fused = fused_proj + self.fusion_mlp(fused_proj)  # Residual: preserve direct mapping
         
-        # 6. Latent parameters
+        # 6. Latent parameters with normalization for stability
+        fused = self.latent_norm(fused)  # Normalize before projection to prevent explosion
         mu = self.mu_proj(fused)
         logvar = self.logvar_proj(fused)
+        
+        # CRITICAL: Clamp to prevent numerical overflow in KL divergence
+        # exp(-10) ≈ 0.000045, exp(10) ≈ 22026 (safe range)
+        mu = torch.clamp(mu, min=-10.0, max=10.0)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        
+        # Additional safety: replace NaN with zeros (emergency fallback)
+        if torch.isnan(mu).any():
+            mu = torch.where(torch.isnan(mu), torch.zeros_like(mu), mu)
+        if torch.isnan(logvar).any():
+            logvar = torch.where(torch.isnan(logvar), torch.zeros_like(logvar), logvar)
         
         return mu, logvar
     
@@ -172,10 +314,10 @@ class BipartiteEncoder(nn.Module):
     def _global_mean_pool(self, x, batch):
         """Global mean pooling"""
         batch_size = batch.max().item() + 1
-        out = torch.zeros(batch_size, x.size(1), device=x.device)
+        out = torch.zeros(batch_size, x.size(1), device=x.device, dtype=x.dtype)
         out.scatter_add_(0, batch.unsqueeze(1).expand_as(x), x)
-        count = torch.zeros(batch_size, device=x.device)
-        count.scatter_add_(0, batch, torch.ones_like(batch, dtype=torch.float))
+        count = torch.zeros(batch_size, device=x.device, dtype=x.dtype)
+        count.scatter_add_(0, batch, torch.ones_like(batch, dtype=x.dtype))
         return out / count.unsqueeze(1).clamp(min=1)
     
     def _create_hyperedge_batch(self, batch):

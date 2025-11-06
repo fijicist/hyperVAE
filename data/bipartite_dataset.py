@@ -1,3 +1,64 @@
+"""
+═══════════════════════════════════════════════════════════════════════════════
+BIPARTITE JET DATASET - PYTORCH GEOMETRIC DATA LOADER
+═══════════════════════════════════════════════════════════════════════════════
+
+Purpose:
+--------
+Load and preprocess jet data in PyTorch Geometric bipartite hypergraph format.
+
+Data Format (PyG Data object):
+-------------------------------
+Each jet is represented as a PyG Data object with:
+
+Nodes (Particles):
+  - particle_x: [N_particles, 4] - 4-momenta [E, px, py, pz] (normalized)
+  - n_particles: int - Number of particles in this jet
+
+Edges (Pairwise particle connections):
+  - edge_index: [2, N_edges] - Particle pairs (bipartite adjacency)
+  - edge_attr: [N_edges, 5] - Edge features [ln_delta, ln_kt, ln_z, ln_m2, feat5]
+
+Hyperedges (Higher-order particle groupings):
+  - hyperedge_index: [2, N_connections] - Particle-hyperedge incidence
+  - hyperedge_x: [N_hyperedges, 2] - Hyperedge features [3pt_eec, 4pt_eec]
+  - n_hyperedges: int - Number of hyperedges in this jet
+
+Jet-level:
+  - y: [num_features] - [jet_type, jet_pt, jet_eta, jet_mass, ...]
+  - jet_type: int - Jet flavor (0=quark, 1=gluon, 2=top)
+
+Usage:
+------
+Load from file:
+    dataset = BipartiteJetDataset(data_path='jets.pt')
+
+Generate dummy data for testing:
+    dataset = BipartiteJetDataset(generate_dummy=True, num_samples=1000)
+
+Split into train/val/test:
+    train, val, test = create_train_val_test_split(dataset)
+
+DataLoader with collation:
+    from torch.utils.data import DataLoader
+    loader = DataLoader(dataset, batch_size=32, collate_fn=collate_bipartite_batch)
+
+Data Preprocessing:
+-------------------
+- 4-momenta: Z-score normalized per feature (E, px, py, pz)
+- Edge features: Log-transformed and normalized
+- Jet features: Standardized to [0, 1] or [-1, 1] range
+- Variable length: Handled via PyG Batch with n_particles/n_edges/n_hyperedges
+
+Collation:
+----------
+collate_bipartite_batch(): Batches multiple jets into single PyG Batch object
+  - Concatenates all particles/edges/hyperedges across batch
+  - Maintains per-jet indexing via n_particles, n_edges, n_hyperedges
+  - Adjusts edge_index and hyperedge_index offsets for batching
+
+═══════════════════════════════════════════════════════════════════════════════
+"""
 import torch
 import numpy as np
 from torch.utils.data import Dataset, Subset
@@ -18,17 +79,18 @@ class BipartiteJetDataset(Dataset):
     - y: [1] - Jet type (0=quark, 1=gluon, 2=top)
     """
     
-    def __init__(self, data_path=None, max_particles=150, generate_dummy=False):
+    def __init__(self, data_path=None, max_particles=150, generate_dummy=False, num_samples=1000):
         """
         Args:
             data_path: Path to .pt file with jet data (PyG Data list)
             max_particles: Maximum particles per jet
             generate_dummy: If True, generate dummy data for testing
+            num_samples: Number of dummy samples to generate (only used if generate_dummy=True)
         """
         self.max_particles = max_particles
         
         if generate_dummy:
-            self.data = self._generate_dummy_data(num_samples=1000)
+            self.data = self._generate_dummy_data(num_samples=num_samples)
         elif data_path:
             self.data = self._load_from_pt(data_path)
         else:
@@ -80,22 +142,21 @@ class BipartiteJetDataset(Dataset):
         Returns:
             Dictionary with bipartite graph data
         """
-        # Extract particle features (x) - only pt, eta, phi (no mass)
-        particle_features = data.x.float()  # [N_particles, 3]
-        if particle_features.shape[1] == 4:
-            # If data has 4 features, keep only first 3 (pt, eta, phi)
-            particle_features = particle_features[:, :3]
-        elif particle_features.shape[1] != 3:
-            raise ValueError(f"Expected 3 or 4 particle features, got {particle_features.shape[1]}")
+        # Extract particle features (x) - keep all features
+        particle_features = data.x.float()  # [N_particles, num_features]
+        # Accept any number of features (3, 4, or more)
         
         # Extract edge features
-        edge_features = data.edge_attr.float() if hasattr(data, 'edge_attr') and data.edge_attr is not None else torch.zeros((0, 5))
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            edge_features = data.edge_attr.float()
+        else:
+            edge_features = torch.zeros((0, 5))  # Default to 5 features if none
         
         # Extract hyperedge features
         if hasattr(data, 'hyperedge_attr') and data.hyperedge_attr is not None:
-            hyperedge_features = data.hyperedge_attr.float()  # [N_hyperedges, 2]
+            hyperedge_features = data.hyperedge_attr.float()
         else:
-            hyperedge_features = torch.zeros((0, 2))
+            hyperedge_features = torch.zeros((0, 1))  # Default to 1 feature if none
         
         # Build bipartite edge index (particle -> hyperedge)
         # hyperedge_index format: [2, N_connections] where each column is [particle_id, hyperedge_id]
@@ -104,10 +165,18 @@ class BipartiteJetDataset(Dataset):
         else:
             edge_index_bipartite = torch.zeros((2, 0), dtype=torch.long)
         
-        # Jet type
-        jet_type = data.y.long() if hasattr(data, 'y') else torch.tensor([0], dtype=torch.long)
-        if jet_type.dim() == 2:
-            jet_type = jet_type.squeeze(1)
+        # Jet type and jet features
+        # y tensor contains: [jet_type, jet_pt, jet_eta, jet_mass, ...]
+        if hasattr(data, 'y') and data.y is not None:
+            y_tensor = data.y.float() if data.y.dtype != torch.long else data.y.float()
+            if y_tensor.dim() == 1:
+                y_tensor = y_tensor.unsqueeze(0)  # [1, num_features]
+            
+            # Extract jet_type (first element, convert to long)
+            jet_type = y_tensor[:, 0].long()
+        else:
+            y_tensor = torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float)  # Default
+            jet_type = torch.tensor([0], dtype=torch.long)
         
         return {
             'particle_features': particle_features,
@@ -115,6 +184,7 @@ class BipartiteJetDataset(Dataset):
             'hyperedge_features': hyperedge_features,
             'edge_index_bipartite': edge_index_bipartite,
             'jet_type': jet_type,
+            'y': y_tensor,  # Full y tensor with jet features
             'n_particles': particle_features.shape[0],
             'n_hyperedges': hyperedge_features.shape[0]
         }
@@ -164,12 +234,19 @@ class BipartiteJetDataset(Dataset):
             # Jet type (0: quark, 1: gluon, 2: top)
             jet_type = torch.tensor([i % 3], dtype=torch.long)
             
+            # Generate jet-level features: [jet_type, jet_pt, jet_eta, jet_mass]
+            jet_pt = np.sum(pt)  # Sum of particle pts
+            jet_eta = np.mean(eta)  # Average eta
+            jet_mass = np.random.uniform(50, 200)  # Random jet mass
+            y_tensor = torch.tensor([[jet_type.item(), jet_pt, jet_eta, jet_mass]], dtype=torch.float)
+            
             data.append({
                 'particle_features': particle_features,
                 'edge_features': edge_features,
                 'hyperedge_features': hyperedge_features,
                 'edge_index_bipartite': edge_index_bipartite,
                 'jet_type': jet_type,
+                'y': y_tensor,  # Full y tensor
                 'n_particles': n_particles,
                 'n_hyperedges': n_hyperedges
             })
@@ -199,6 +276,7 @@ class BipartiteJetDataset(Dataset):
             edge_attr=sample['edge_features'],
             edge_index=sample['edge_index_bipartite'],
             jet_type=sample['jet_type'],
+            y=sample['y'],  # Include full y tensor
             n_particles=torch.tensor([n_particles]),
             n_hyperedges=torch.tensor([n_hyperedges]),
             num_nodes=n_particles + n_hyperedges  # Total nodes in bipartite graph

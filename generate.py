@@ -1,3 +1,124 @@
+"""
+═══════════════════════════════════════════════════════════════════════════════
+GENERATION SCRIPT - SAMPLE JETS FROM TRAINED HYPERVAE
+═══════════════════════════════════════════════════════════════════════════════
+
+Purpose:
+--------
+Generate synthetic jets by sampling from the trained VAE's latent space.
+Outputs jets in PyTorch Geometric Data format for downstream analysis.
+
+Usage:
+------
+Generate jets from best checkpoint:
+    python generate.py --checkpoint checkpoints/best_model.pt \
+                       --output generated_jets.pt \
+                       --num-samples 10000 \
+                       --gpu
+
+Key Features:
+-------------
+1. LATENT SAMPLING: Sample z ~ N(0, I) from VAE prior
+2. CONDITIONAL GENERATION: Control jet type distribution (quark/gluon/top)
+3. BATCH GENERATION: Memory-efficient batched sampling
+4. PyG FORMAT: Output as list of PyTorch Geometric Data objects
+5. PARTICLE-ONLY: Generates particle 4-momenta (no edges/hyperedges by default)
+
+Generation Pipeline:
+--------------------
+For each batch:
+    1. Sample latent vectors: z ~ N(0, I)
+    2. Sample jet types from distribution
+    3. Decode: z, jet_type → particles (4-momenta)
+    4. Threshold particle mask (keep only valid particles)
+    5. Convert to PyG Data format
+    6. Save as list of Data objects
+
+Output Format:
+--------------
+Saves a list of PyG Data objects to --output path:
+
+    data_list = [
+        Data(
+            particle_x=[n_particles_1, 4],  # 4-momenta [E, px, py, pz]
+            n_particles=n_particles_1,
+            jet_type=0,                      # 0=quark, 1=gluon, 2=top
+            y=[1, num_jet_features]          # [jet_type, jet_pt, jet_eta, jet_mass, ...]
+        ),
+        Data(...),  # jet 2
+        ...         # 10000 jets total
+    ]
+
+Load with:
+    import torch
+    data_list = torch.load('generated_jets.pt')
+    print(f"Generated {len(data_list)} jets")
+    print(f"First jet: {data_list[0].n_particles} particles")
+
+Arguments:
+----------
+--checkpoint: Path to trained model checkpoint (.pt file)
+--output: Path to save generated jets (.pt file)
+--num-samples: Number of jets to generate (default: 1000)
+--batch-size: Generation batch size (default: 128)
+--jet-type-dist: Jet type distribution as "q,g,t" (default: "0.33,0.33,0.34")
+                 Example: "0.5,0.3,0.2" = 50% quark, 30% gluon, 20% top
+--gpu: Use GPU if available (default: True)
+--temperature: Gumbel-Softmax temperature for mask sampling (default: 0.5)
+               Lower = more deterministic, Higher = more stochastic
+
+Jet Type Distribution:
+----------------------
+Controls the proportion of each jet flavor in the generated sample:
+- Quark jets (type 0): Light quark fragmentation, fewer particles
+- Gluon jets (type 1): More radiation, higher multiplicity
+- Top jets (type 2): Heavy top decay, boosted substructure
+
+Default "0.33,0.33,0.34" generates balanced dataset.
+For realistic physics, use data-driven distribution from training set.
+
+Typical Usage Patterns:
+-----------------------
+1. Generate test set for evaluation:
+    python generate.py --checkpoint best_model.pt --output test_gen.pt --num-samples 10000
+
+2. Generate large sample for analysis:
+    python generate.py --checkpoint best_model.pt --output large_sample.pt --num-samples 100000 --batch-size 256
+
+3. Generate specific jet types (e.g., only gluon jets):
+    python generate.py --checkpoint best_model.pt --output gluon_jets.pt --num-samples 5000 --jet-type-dist "0,1,0"
+
+4. GPU acceleration:
+    python generate.py --checkpoint best_model.pt --output jets.pt --num-samples 50000 --gpu
+
+Output Validation:
+------------------
+After generation, validate outputs with:
+    python evaluate.py --real-data data/real/jets.pt --generated-data generated_jets.pt
+
+This computes Wasserstein distances and generates comparison plots.
+
+Troubleshooting:
+----------------
+Issue: Generated particles have invalid 4-momenta (E < |p⃗|)
+- L-GATr should prevent this, but check decoder temperature
+- Lower temperature (0.3-0.5) = more conservative/physical outputs
+
+Issue: Too many/few particles per jet
+- Check model.decoder.max_particles setting
+- Check particle_mask thresholding (threshold > 0.5 for validity)
+
+Issue: OOM during generation
+- Reduce --batch-size (128 → 64 or 32)
+- Generate in multiple runs and concatenate
+
+Issue: Slow generation
+- Use --gpu flag (10-50× speedup)
+- Increase --batch-size if memory allows
+- Generation is much faster than training (~1000 jets/sec on GPU)
+
+═══════════════════════════════════════════════════════════════════════════════
+"""
 import torch
 import yaml
 import argparse
@@ -8,19 +129,27 @@ from torch_geometric.data import Data
 from models.hypervae import BipartiteHyperVAE
 
 
-def generate_jets(model, num_samples, jet_type_dist, device, batch_size=32):
+def generate_jets(model, num_samples, batch_size, jet_type_dist, device):
     """
-    Generate jets using the trained model.
+    Generate jets using trained VAE model by sampling from latent prior.
+    
+    Samples latent vectors z ~ N(0, I) and decodes them to particle 4-momenta
+    conditioned on jet type. Generates particle features only (no edges/hyperedges).
     
     Args:
-        model: Trained BipartiteHyperVAE model
-        num_samples: Number of jets to generate
-        jet_type_dist: Distribution of jet types [quark_frac, gluon_frac, top_frac]
-        device: Device to generate on
-        batch_size: Batch size for generation
+        model: Trained BipartiteHyperVAE model in eval mode
+        num_samples: Total number of jets to generate
+        batch_size: Batch size for generation (memory vs speed tradeoff)
+        jet_type_dist: [3] array with jet type probabilities [p_quark, p_gluon, p_top]
+                       Must sum to 1.0
+        device: torch.device for generation ('cuda' or 'cpu')
     
     Returns:
-        Dictionary with generated jet features
+        dict with keys:
+            'particle_features': List of [n_particles, 4] arrays (4-momenta per jet)
+            'jet_features': List of [num_jet_features] arrays (jet-level observables)
+            'jet_types': List of jet type integers (0=quark, 1=gluon, 2=top)
+            'n_particles': List of particle counts per jet
     """
     model.eval()
     
@@ -32,11 +161,9 @@ def generate_jets(model, num_samples, jet_type_dist, device, batch_size=32):
     )
     
     all_particle_features = []
-    all_edge_features = []
-    all_hyperedge_features = []
     all_jet_types = []
+    all_jet_features = []
     all_n_particles = []
-    all_n_hyperedges = []
     
     with torch.no_grad():
         for i in tqdm(range(0, num_samples, batch_size), desc="Generating jets"):
@@ -47,118 +174,99 @@ def generate_jets(model, num_samples, jet_type_dist, device, batch_size=32):
             z = torch.randn(current_batch_size, model.config['model']['latent_dim'], device=device)
             jet_type_tensor = torch.tensor(batch_jet_types, dtype=torch.long, device=device)
             
-            # Generate
-            output = model.decoder(z, jet_type_tensor, temperature=0.5)
+            # Generate (particles only - no edges/hyperedges)
+            output = model.decoder(
+                z, 
+                jet_type_tensor, 
+                temperature=0.5,
+                generate_edges=False,        # ✅ Don't generate edges
+                generate_hyperedges=False    # ✅ Don't generate hyperedges
+            )
             
-            # Extract features
+            # Extract particle features and jet features
             particle_features = output['particle_features'].cpu().numpy()
-            edge_features = output['edge_features'].cpu().numpy()
-            hyperedge_features = output['hyperedge_features'].cpu().numpy()
+            jet_features = output['jet_features'].cpu().numpy()  # [batch_size, num_jet_features]
             n_particles = output['topology']['n_particles'].cpu().numpy()
-            n_hyperedges = output['topology']['n_hyperedges'].cpu().numpy()
             
             # Store
             for j in range(current_batch_size):
                 n_p = int(n_particles[j])
-                n_he = int(n_hyperedges[j])
                 
                 # Only store non-zero particles
                 if n_p > 0:
                     all_particle_features.append(particle_features[j, :n_p])
                     all_n_particles.append(n_p)
                 else:
-                    all_particle_features.append(np.zeros((1, 4)))
+                    # Use actual feature dimension from model config
+                    num_features = particle_features.shape[-1]
+                    all_particle_features.append(np.zeros((1, num_features)))
                     all_n_particles.append(1)
                 
-                # Store edge and hyperedge features
-                all_edge_features.append(edge_features[j])
-                all_hyperedge_features.append(hyperedge_features[j, :n_he] if n_he > 0 else np.zeros((1, 2)))
-                all_n_hyperedges.append(n_he)
+                # Store jet features and jet type
+                all_jet_features.append(jet_features[j])
                 all_jet_types.append(batch_jet_types[j])
     
     return {
         'particle_features': all_particle_features,
-        'edge_features': all_edge_features,
-        'hyperedge_features': all_hyperedge_features,
+        'jet_features': all_jet_features,
         'jet_types': np.array(all_jet_types),
-        'n_particles': np.array(all_n_particles),
-        'n_hyperedges': np.array(all_n_hyperedges)
+        'n_particles': np.array(all_n_particles)
     }
 
 
 def save_generated_jets(generated_data, output_path):
-    """Save generated jets to .pt file (PyG Data format)"""
+    """Save generated jets to .pt file (PyG Data format) - particles and jet features"""
     print(f"\nSaving generated jets to {output_path}...")
     
     data_list = []
     
     for i in range(len(generated_data['jet_types'])):
-        # Get features
+        # Get particle features
         particle_feat = torch.tensor(generated_data['particle_features'][i], dtype=torch.float32)
-        edge_feat = torch.tensor(generated_data['edge_features'][i], dtype=torch.float32)
-        hyperedge_feat = torch.tensor(generated_data['hyperedge_features'][i], dtype=torch.float32)
         
-        # Create dummy edge_index (2-point connections between particles)
-        n_particles = particle_feat.shape[0]
-        if n_particles > 1:
-            # Create pairwise edges
-            edge_pairs = []
-            for j in range(min(n_particles, 10)):  # Limit edges
-                for k in range(j+1, min(n_particles, 10)):
-                    edge_pairs.append([j, k])
-            if edge_pairs:
-                edge_index = torch.tensor(edge_pairs, dtype=torch.long).T
-            else:
-                edge_index = torch.zeros((2, 0), dtype=torch.long)
-        else:
-            edge_index = torch.zeros((2, 0), dtype=torch.long)
+        # Combine jet_type (at index 0) with jet features (jet_pt, jet_eta, jet_mass)
+        jet_type = generated_data['jet_types'][i]
+        jet_features = generated_data['jet_features'][i]
         
-        # Create dummy hyperedge_index (particle -> hyperedge connections)
-        n_hyperedges = hyperedge_feat.shape[0]
-        hyperedge_connections = []
-        for h_idx in range(n_hyperedges):
-            # Connect 3-4 random particles to each hyperedge
-            n_conn = min(np.random.randint(3, 5), n_particles)
-            particles = np.random.choice(n_particles, n_conn, replace=False)
-            for p_idx in particles:
-                hyperedge_connections.append([p_idx, h_idx])
-        
-        if hyperedge_connections:
-            hyperedge_index = torch.tensor(hyperedge_connections, dtype=torch.long).T
-        else:
-            hyperedge_index = torch.zeros((2, 0), dtype=torch.long)
+        # Create y tensor: [jet_type, jet_pt, jet_eta, jet_mass, ...]
+        y = torch.cat([
+            torch.tensor([jet_type], dtype=torch.float32),
+            torch.tensor(jet_features, dtype=torch.float32)
+        ])
         
         # Create PyG Data object
         data = Data(
-            x=particle_feat,
-            edge_index=edge_index,
-            edge_attr=edge_feat[:edge_index.shape[1]] if edge_feat.shape[0] > 0 else torch.zeros((edge_index.shape[1], 5)),
-            hyperedge_index=hyperedge_index,
-            hyperedge_attr=hyperedge_feat,
-            y=torch.tensor([generated_data['jet_types'][i]], dtype=torch.long)
+            x=particle_feat,  # [n_particles, num_features] - particle features
+            y=y,              # [1 + num_jet_features] - jet_type + jet_features
+            num_nodes=particle_feat.size(0)
         )
         
         data_list.append(data)
     
-    # Save as .pt file
+    # Save to file
     torch.save(data_list, output_path)
-    print(f"Saved {len(data_list)} generated jets in PyG format")
+    print(f"Saved {len(data_list)} jets to {output_path}")
 
 
 def print_statistics(generated_data):
-    """Print statistics of generated jets"""
+    """Print statistics about generated jets (particles only)"""
     print("\n" + "="*60)
     print("Generated Jet Statistics")
     print("="*60)
     
-    # Jet type distribution
+    # Jet types
     jet_types = generated_data['jet_types']
-    print(f"\nJet Type Distribution:")
-    print(f"  Quark: {(jet_types == 0).sum()} ({(jet_types == 0).mean()*100:.1f}%)")
-    print(f"  Gluon: {(jet_types == 1).sum()} ({(jet_types == 1).mean()*100:.1f}%)")
-    print(f"  Top:   {(jet_types == 2).sum()} ({(jet_types == 2).mean()*100:.1f}%)")
+    n_quark = (jet_types == 0).sum()
+    n_gluon = (jet_types == 1).sum()
+    n_top = (jet_types == 2).sum()
+    total = len(jet_types)
     
-    # Number of particles
+    print(f"\nJet Type Distribution:")
+    print(f"  Quark: {n_quark} ({100*n_quark/total:.1f}%)")
+    print(f"  Gluon: {n_gluon} ({100*n_gluon/total:.1f}%)")
+    print(f"  Top:   {n_top} ({100*n_top/total:.1f}%)")
+    
+    # Particles
     n_particles = generated_data['n_particles']
     print(f"\nParticles per Jet:")
     print(f"  Mean: {n_particles.mean():.2f}")
@@ -166,20 +274,44 @@ def print_statistics(generated_data):
     print(f"  Min:  {n_particles.min()}")
     print(f"  Max:  {n_particles.max()}")
     
-    # Particle features statistics
+    # Particle features
     all_particles = np.concatenate(generated_data['particle_features'], axis=0)
+    num_features = all_particles.shape[1]
     print(f"\nParticle Feature Statistics:")
     print(f"  Total particles: {all_particles.shape[0]}")
-    print(f"  pt   - Mean: {all_particles[:, 0].mean():.2f}, Std: {all_particles[:, 0].std():.2f}")
-    print(f"  eta  - Mean: {all_particles[:, 1].mean():.2f}, Std: {all_particles[:, 1].std():.2f}")
-    print(f"  phi  - Mean: {all_particles[:, 2].mean():.2f}, Std: {all_particles[:, 2].std():.2f}")
-    print(f"  mass - Mean: {all_particles[:, 3].mean():.2f}, Std: {all_particles[:, 3].std():.2f}")
+    print(f"  Feature dimensions: {num_features}")
     
-    # Hyperedges
-    n_hyperedges = generated_data['n_hyperedges']
-    print(f"\nHyperedges per Jet:")
-    print(f"  Mean: {n_hyperedges.mean():.2f}")
-    print(f"  Std:  {n_hyperedges.std():.2f}")
+    # Print feature statistics based on number of features
+    if num_features == 3:
+        print(f"  Features: (pt, eta, phi)")
+        print(f"  pt   - Mean: {all_particles[:, 0].mean():.2f}, Std: {all_particles[:, 0].std():.2f}")
+        print(f"  eta  - Mean: {all_particles[:, 1].mean():.2f}, Std: {all_particles[:, 1].std():.2f}")
+        print(f"  phi  - Mean: {all_particles[:, 2].mean():.2f}, Std: {all_particles[:, 2].std():.2f}")
+    elif num_features == 4:
+        print(f"  Features: (E, px, py, pz)")
+        print(f"  E    - Mean: {all_particles[:, 0].mean():.2f}, Std: {all_particles[:, 0].std():.2f}")
+        print(f"  px   - Mean: {all_particles[:, 1].mean():.2f}, Std: {all_particles[:, 1].std():.2f}")
+        print(f"  py   - Mean: {all_particles[:, 2].mean():.2f}, Std: {all_particles[:, 2].std():.2f}")
+        print(f"  pz   - Mean: {all_particles[:, 3].mean():.2f}, Std: {all_particles[:, 3].std():.2f}")
+    else:
+        print(f"  Feature statistics for {num_features} features:")
+        for i in range(num_features):
+            print(f"  feat{i} - Mean: {all_particles[:, i].mean():.2f}, Std: {all_particles[:, i].std():.2f}")
+    
+    # Jet features
+    jet_features = np.array(generated_data['jet_features'])
+    num_jet_features = jet_features.shape[1]
+    print(f"\nJet Feature Statistics:")
+    print(f"  Number of jet features: {num_jet_features}")
+    if num_jet_features >= 3:
+        print(f"  Features: (jet_pt, jet_eta, jet_mass)")
+        print(f"  jet_pt   - Mean: {jet_features[:, 0].mean():.2f}, Std: {jet_features[:, 0].std():.2f}")
+        print(f"  jet_eta  - Mean: {jet_features[:, 1].mean():.2f}, Std: {jet_features[:, 1].std():.2f}")
+        print(f"  jet_mass - Mean: {jet_features[:, 2].mean():.2f}, Std: {jet_features[:, 2].std():.2f}")
+    else:
+        for i in range(num_jet_features):
+            print(f"  jet_feat{i} - Mean: {jet_features[:, i].mean():.2f}, Std: {jet_features[:, i].std():.2f}")
+
 
 
 def main(args):
@@ -197,19 +329,34 @@ def main(args):
     print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
     
     # Jet type distribution
-    jet_type_dist = [args.quark_frac, args.gluon_frac, args.top_frac]
-    jet_type_dist = np.array(jet_type_dist) / sum(jet_type_dist)
-    print(f"\nJet type distribution: Quark={jet_type_dist[0]:.2f}, "
-          f"Gluon={jet_type_dist[1]:.2f}, Top={jet_type_dist[2]:.2f}")
+    if args.jet_type is not None:
+        # Single jet type mode
+        jet_type_map = {'quark': 0, 'q': 0, 'gluon': 1, 'g': 1, 'top': 2, 't': 2}
+        jet_type_name_map = {0: 'Quark', 1: 'Gluon', 2: 'Top'}
+        
+        jet_type_lower = args.jet_type.lower()
+        if jet_type_lower not in jet_type_map:
+            raise ValueError(f"Invalid jet type: {args.jet_type}. Use 'quark', 'gluon', or 'top'")
+        
+        jet_type_idx = jet_type_map[jet_type_lower]
+        jet_type_dist = [0.0, 0.0, 0.0]
+        jet_type_dist[jet_type_idx] = 1.0
+        print(f"\nGenerating only {jet_type_name_map[jet_type_idx]} jets")
+    else:
+        # Mixed jet type mode (legacy)
+        jet_type_dist = [args.quark_frac, args.gluon_frac, args.top_frac]
+        jet_type_dist = np.array(jet_type_dist) / sum(jet_type_dist)
+        print(f"\nJet type distribution: Quark={jet_type_dist[0]:.2f}, "
+              f"Gluon={jet_type_dist[1]:.2f}, Top={jet_type_dist[2]:.2f}")
     
     # Generate jets
     print(f"\nGenerating {args.num_samples} jets...")
     generated_data = generate_jets(
         model, 
-        args.num_samples, 
-        jet_type_dist, 
-        device,
-        batch_size=args.batch_size
+        args.num_samples,
+        args.batch_size,  
+        jet_type_dist,    
+        device
     )
     
     # Print statistics
@@ -228,9 +375,11 @@ if __name__ == "__main__":
     parser.add_argument('--output', type=str, default='generated_jets.pt', help='Output .pt file')
     parser.add_argument('--num-samples', type=int, default=10000, help='Number of jets to generate')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size for generation')
-    parser.add_argument('--quark-frac', type=float, default=0.33, help='Fraction of quark jets')
-    parser.add_argument('--gluon-frac', type=float, default=0.33, help='Fraction of gluon jets')
-    parser.add_argument('--top-frac', type=float, default=0.34, help='Fraction of top jets')
+    parser.add_argument('--jet-type', type=str, default=None, 
+                        help='Generate single jet type: "quark"/"q", "gluon"/"g", or "top"/"t" (overrides frac args)')
+    parser.add_argument('--quark-frac', type=float, default=0.33, help='Fraction of quark jets (used if --jet-type not set)')
+    parser.add_argument('--gluon-frac', type=float, default=0.33, help='Fraction of gluon jets (used if --jet-type not set)')
+    parser.add_argument('--top-frac', type=float, default=0.34, help='Fraction of top jets (used if --jet-type not set)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if available')
     
     args = parser.parse_args()
