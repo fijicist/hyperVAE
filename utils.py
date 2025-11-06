@@ -21,6 +21,7 @@ See individual function docstrings for detailed usage.
 
 import numpy as np
 import torch
+import gc
 import itertools
 import matplotlib.pyplot as plt
 import eec
@@ -224,6 +225,10 @@ def construct_n_point_hyperedges(num_nodes, old_x, additional_hypergraph_attrs, 
         )
 
         print(f"Finished processing {n_val}-point hyperedges.")
+        
+        # Flush RAM after processing each n-point order to prevent OOM
+        # Hyperedge computation is CPU-intensive and generates large intermediate arrays
+        gc.collect()
 
         # Flatten results from parallel execution
         for batch_result in results:
@@ -259,6 +264,11 @@ def construct_n_point_hyperedges(num_nodes, old_x, additional_hypergraph_attrs, 
 
     # Convert the list of hyperedge attributes to a tensor
     hyperedge_attr = torch.tensor(all_hyperedge_attrs, dtype=torch.float32)
+    
+    # Flush RAM after tensor construction to prevent OOM
+    # Delete large intermediate lists and force garbage collection
+    del all_hyperedges, all_hyperedge_attrs, row_indices, col_indices
+    gc.collect()
     
     return hyperedge_index, hyperedge_attr
 

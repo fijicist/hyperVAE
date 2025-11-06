@@ -567,6 +567,12 @@ def _construct_particle_graphs_pyg(
     # ═══════════════════════════════════════════════════════════════════════════
     # GRAPH CONSTRUCTION LOOP
     # ═══════════════════════════════════════════════════════════════════════════
+    # RAM Memory optimization strategy (hyperedge computation is CPU-bound):
+    # 1. Flush RAM every 1000 graphs during construction (gc.collect())
+    # 2. Flush RAM after saving batches (every 85k graphs)  
+    # 3. Flush RAM after constructing hyperedges for each graph
+    # 4. This prevents OOM when processing large datasets with hyperedges
+    # ═══════════════════════════════════════════════════════════════════════════
     for graph_structure in graph_structures:
         graph_key = f'particle__{graph_structure}'
         all_edge_features = []
@@ -582,6 +588,11 @@ def _construct_particle_graphs_pyg(
             # Collect edge features for normalization (index 1 onwards only)
             if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
                 all_edge_features.append(graph.edge_attr[:, 1:].cpu().numpy())
+            
+            # Flush RAM periodically (every 1000 graphs) to prevent gradual OOM
+            # Force garbage collection to free up memory from hyperedge computations
+            if (i + 1) % 1000 == 0:
+                gc.collect()
 
             # Save to file every 85000 iterations
             if (i + 1) % 85000 == 0:
@@ -590,6 +601,11 @@ def _construct_particle_graphs_pyg(
                 print(f'  Saved PyG graphs to {partial_graph_filename}.')
                 saved_filenames.append(partial_graph_filename)
                 graph_list = []
+                
+                # Flush RAM after batch save to prevent OOM
+                # Free up memory from processed graphs
+                gc.collect()
+                print(f'  RAM flushed after saving batch {i // 85000 + 1}.')
 
         # Save any remaining graphs
         if graph_list:
@@ -839,6 +855,12 @@ def _construct_particle_graph_pyg(
         hyperedge_index = hyperedge_index.to_dense().type(torch.int)  # Convert to full binary coincidence matrix (dense tensor)
         end_time = time.perf_counter()
         print(f"Time taken to construct hyperedges: {end_time - start_time:.2f} seconds.")
+        
+        # Flush RAM after hyperedge construction to prevent OOM
+        # Delete temporary variables and force garbage collection
+        del start_time, end_time
+        gc.collect()
+        
         # print(hyperedge_index, hyperedge_attr, hyperedge_index.shape, hyperedge_attr.shape)
         # print(node_features.shape, edge_indices_long.shape, edge_features_tensor.shape, graph_label.shape)
 
