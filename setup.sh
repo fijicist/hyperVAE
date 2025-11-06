@@ -249,8 +249,12 @@ fi
 
 echo ""
 echo "→ Installing particle physics libraries..."
-echo "  (fastjet, awkward, energyflow, EEC, jetnet)"
-pip install fastjet>=3.4.0 awkward>=2.6.0 energyflow>=1.3.0 energyenergycorrelators>=2.0.0b1 jetnet>=0.2.5
+echo "  (fastjet, awkward, energyflow, jetnet)"
+pip install fastjet>=3.4.0 awkward>=2.6.0 energyflow>=1.3.0 jetnet>=0.2.5
+
+echo ""
+echo "→ Installing EnergyEnergyCorrelators from GitHub..."
+pip install git+https://github.com/pkomiske/EnergyEnergyCorrelators.git
 
 echo ""
 echo "→ Installing ML utilities..."
