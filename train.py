@@ -416,7 +416,7 @@ def main(args):
     )
     
     # Create model
-    model = BipartiteHyperVAE(config).to(device)
+    model = torch.nn.DataParallel(BipartiteHyperVAE(config), device_ids=[0, 1]).to(device)
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
     # Optimizer
@@ -454,7 +454,7 @@ def main(args):
     if args.resume:
         if os.path.exists(args.resume):
             print(f"\nLoading checkpoint from: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1

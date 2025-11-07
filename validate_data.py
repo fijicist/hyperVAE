@@ -81,7 +81,7 @@ def validate_data_file(file_path):
         # STEP 1: Load Data
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         print("\n[1/5] Loading data file...")
-        data_list = torch.load(file_path)
+        data_list = torch.load(file_path, weights_only=False)
         print(f"      ✓ File loaded successfully")
         
         # Check if it's a list

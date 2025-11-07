@@ -4,7 +4,7 @@ model:
   edge_hidden: 96             # Keep at 96 - edges are auxiliary
   hyperedge_hidden: 64        # Keep at 64 - hyperedges are simple
   jet_hidden: 128             # INCREASE 96→128: Jet loss is high, needs more capacity
-  latent_dim: 32              # Keep at 64 - sufficient capacity
+  latent_dim: 64              # Keep at 64 - sufficient capacity
   attention_heads: 4          # Keep at 4 - stable
   max_particles: 60
 
@@ -38,15 +38,15 @@ model:
       # Geometric Algebra (GA) Multivector Channels
       in_mv_channels: 1         # Input: 1 channel of 4-vectors (E, px, py, pz)
       out_mv_channels: 0        # Output: no multivector (project to scalars for latent)
-      hidden_mv_channels: 16     # Hidden GA multivector channels
+      hidden_mv_channels: 32     # Hidden GA multivector channels
       
       # Scalar Channels (non-geometric features)
       in_s_channels: 0          # No additional scalar inputs (all info in 4-momentum)
-      out_s_channels: 32        # Output: scalar embedding for latent projection
-      hidden_s_channels: 32     # Hidden scalar channels
+      out_s_channels: 64        # Output: scalar embedding for latent projection
+      hidden_s_channels: 64     # Hidden scalar channels
       
       # === TRANSFORMER ARCHITECTURE ===
-      num_blocks: 2             # Number of L-GATr transformer blocks (overrides particle_layers if set)
+      num_blocks: 4             # Number of L-GATr transformer blocks (overrides particle_layers if set)
       
       # Attention Configuration
       attention:
@@ -59,7 +59,7 @@ model:
       # MLP Configuration (between attention layers)
       mlp:
         activation: "gelu"      # GELU activation (standard for transformers)
-        num_hidden_layers: 2   # MLP depth in each block
+        num_hidden_layers: 3   # MLP depth in each block
     
     # Edge encoding (MLP layers with residual connections)
     edge_layers: 5            # Number of MLP layers for edges
@@ -68,7 +68,7 @@ model:
     hyperedge_layers: 3       # Number of MLP layers for hyperedges
     
     # Jet-level feature encoding (MLP layers with residual connections)
-    jet_layers: 2             # Number of MLP layers for jet features
+    jet_layers: 4             # Number of MLP layers for jet features
     
     # Regularization
     dropout: 0.25             # Dropout rate for all encoder layers (non-LGATr)
@@ -86,15 +86,15 @@ model:
       # Geometric Algebra (GA) Multivector Channels
       in_mv_channels: 1         # Input: 1 channel of 4-vectors (seed for generation)
       out_mv_channels: 1        # Output: 1 channel of 4-vectors (E, px, py, pz)
-      hidden_mv_channels: 16     # Hidden GA multivector channels (match encoder)
+      hidden_mv_channels: 32     # Hidden GA multivector channels (match encoder)
       
       # Scalar Channels (non-geometric features)
-      in_s_channels: 32         # Input: scalar features from latent
+      in_s_channels: 64         # Input: scalar features from latent
       out_s_channels: 0         # Output: no additional scalars (only 4-vectors)
-      hidden_s_channels: 32     # Hidden scalar channels (match encoder)
+      hidden_s_channels: 64     # Hidden scalar channels (match encoder)
       
       # === TRANSFORMER ARCHITECTURE ===
-      num_blocks: 2             # Number of L-GATr transformer blocks (match encoder)
+      num_blocks: 4             # Number of L-GATr transformer blocks (match encoder)
       
       # Attention Configuration
       attention:
@@ -107,7 +107,7 @@ model:
       # MLP Configuration (between attention layers)
       mlp:
         activation: "gelu"      # GELU activation (standard for transformers)
-        num_hidden_layers: 2   # MLP depth in each block
+        num_hidden_layers: 3   # MLP depth in each block
     
     # Edge decoding (MLP layers with residual connections)
     edge_layers: 5            # Number of MLP layers for edges (matches encoder)
@@ -116,7 +116,7 @@ model:
     hyperedge_layers: 3       # Number of MLP layers for hyperedges (matches encoder)
     
     # Jet-level feature decoding (MLP layers with residual connections)
-    jet_layers: 2             # Number of MLP layers for jet features (matches encoder)
+    jet_layers: 4             # Number of MLP layers for jet features (matches encoder)
     
     # Regularization - Increased to combat overfitting
     dropout: 0.3              # Dropout rate for all decoder layers (0.25→0.3)
@@ -128,9 +128,9 @@ model:
     gumbel_temperature: 1.0
 
 training:
-  batch_size: 64                  # Effective batch = 64 * 4 = 256
+  batch_size: 256                  # Effective batch = 64 * 4 = 256
   gradient_accumulation_steps: 4  # Good for memory constraints
-  epochs: 100
+  epochs: 200
   learning_rate: 0.0001           # REDUCE 0.00025→0.0002: Finer updates for stability
   weight_decay: 0.001             # Keep: L2 regularization
   latent_noise: 0.01              # Keep: noise for regularization
@@ -151,8 +151,8 @@ training:
   # REBALANCED LOSS WEIGHTS - N_constituents removed from jet loss
   loss_weights:
     particle_features: 12000.0    # Particle Chamfer distance
-    edge_features: 2500.0        # Auxiliary loss 
-    hyperedge_features: 1500.0   # Auxiliary loss
+    edge_features: 4000.0        # Auxiliary loss 
+    hyperedge_features: 2500.0   # Auxiliary loss
     jet_features: 6000.0         # REDUCE 8000→6000: N_constituents was inflating this
     kl_divergence: 0.3           # Gentle regularization
   
@@ -191,7 +191,7 @@ training:
     
     # Jet features loss weights (individual MSE components)
     jet_pt_weight: 2.5          # Weight for MSE(jet_pt)
-    jet_eta_weight: 0.75         # Weight for MSE(jet_eta)
+    jet_eta_weight: 1.0         # Weight for MSE(jet_eta)
     jet_mass_weight: 2.0        # Weight for MSE(jet_mass)
     jet_n_constituents_weight: 0.0  # DISABLE: MSE on integer counts has wrong scale (400 >> 1)
   

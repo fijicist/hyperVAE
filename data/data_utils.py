@@ -150,7 +150,7 @@ class JetFeatureNormalizer:
     
     def load(self, path):
         """Load normalization statistics"""
-        stats = torch.load(path)
+        stats = torch.load(path, weights_only=False)
         self.particle_mean = stats['particle_mean']
         self.particle_std = stats['particle_std']
         self.edge_mean = stats.get('edge_mean')

@@ -316,7 +316,7 @@ def print_statistics(generated_data):
 
 def main(args):
     # Load config
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
+    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     config = checkpoint['config']
     
     # Device

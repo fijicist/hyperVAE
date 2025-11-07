@@ -123,7 +123,7 @@ GRAPH_CONSTRUCTION_CONFIG = {
     'graph_structures': ['fully_connected'],
     
     # Number of jets to process
-    'N': 10,
+    'N': 30000,
     
     # Dataset source: 'jetnet' or 'energyflow'
     'dataset': 'jetnet',
@@ -631,7 +631,7 @@ def _construct_particle_graphs_pyg(
             print(f'    Applying normalization to {len(saved_filenames)} saved file(s)...')
             edge_idx = 0  # Track position in stacked_edges
             for filename in tqdm.tqdm(saved_filenames, desc=f'  Normalizing edge features: {graph_key}'):
-                graphs = torch.load(filename)
+                graphs = torch.load(filename, weights_only=False)
                 for graph in graphs:
                     if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
                         n_edges = graph.edge_attr.shape[0]
