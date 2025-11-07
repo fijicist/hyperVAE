@@ -416,7 +416,7 @@ def main(args):
     )
     
     # Create model
-    model = torch.nn.DataParallel(BipartiteHyperVAE(config), device_ids=[0, 1]).to(device)
+    model = BipartiteHyperVAE(config).to(device)
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
     # Optimizer
