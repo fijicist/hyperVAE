@@ -195,10 +195,15 @@ training:
     jet_mass_weight: 2.0        # Weight for MSE(jet_mass)
     jet_n_constituents_weight: 0.0  # DISABLE: MSE on integer counts has wrong scale (400 >> 1)
   
-  # KL annealing - Reduced free bits to enable some regularization
-  kl_warmup_epochs: 15           # Gradual warmup over 15 epochs
-  kl_free_bits: 3.0              # REDUCE 5.0→3.0: KL stuck at 0, need some regularization
-  kl_max_weight: 1.0             # Max multiplier for kl_divergence weight (0.3)  
+  # KL annealing - Cyclical schedule 
+  kl_annealing_schedule: 'cyclical'  # Options: 'linear', 'cyclical'
+  kl_warmup_epochs: 12           # Warmup: 12 epochs (0.00 → max_weight)
+  kl_cycle_epochs: 30            # Cycle: 30 epochs total (12 warmup + 18 plateau)
+                                 # Reset every 30 epochs to prevent explosion
+  kl_free_bits: 2.0              # Free bits
+                                 # Allows KL to grow naturally but not collapse to 0
+  kl_max_weight: 0.25            # TUNED: Max multiplier for kl_divergence weight
+                                 # Effective max KL weight = 0.3 * 0.25 = 0.075
 
   # Temperature annealing for Gumbel-Softmax
   initial_temperature: 5.0
