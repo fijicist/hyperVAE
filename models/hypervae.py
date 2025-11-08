@@ -374,10 +374,27 @@ class BipartiteHyperVAE(nn.Module):
         # 5. KL divergence
         kl_loss = self._kl_divergence(output['mu'], output['logvar'])
         
-        # KL annealing with maximum cap
+        # KL annealing with cyclical schedule support
+        kl_annealing_schedule = self.config['training'].get('kl_annealing_schedule', 'linear')
         kl_warmup_epochs = self.config['training'].get('kl_warmup_epochs', 100)
         kl_max_weight = self.config['training'].get('kl_max_weight', 1.0)
-        kl_weight = min(kl_max_weight, epoch / kl_warmup_epochs) if kl_warmup_epochs > 0 else kl_max_weight
+        
+        if kl_annealing_schedule == 'cyclical':
+            # Cyclical annealing: prevents posterior collapse and KL explosion
+            # Cycle: [warmup -> plateau] repeated throughout training
+            kl_cycle_epochs = self.config['training'].get('kl_cycle_epochs', 50)
+            epoch_in_cycle = epoch % kl_cycle_epochs
+            
+            if epoch_in_cycle < kl_warmup_epochs:
+                # Warmup phase: gradually increase from 0 to kl_max_weight
+                kl_weight = kl_max_weight * (epoch_in_cycle / kl_warmup_epochs)
+            else:
+                # Plateau phase: maintain kl_max_weight
+                kl_weight = kl_max_weight
+        else:
+            # Linear annealing (original): increases once then plateaus
+            kl_weight = min(kl_max_weight, epoch / kl_warmup_epochs) if kl_warmup_epochs > 0 else kl_max_weight
+        
         losses['kl'] = kl_loss
         losses['kl_raw'] = kl_loss.item()  # Log raw KL for monitoring
         

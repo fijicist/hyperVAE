@@ -195,10 +195,14 @@ training:
     jet_mass_weight: 2.0        # Weight for MSE(jet_mass)
     jet_n_constituents_weight: 0.0  # DISABLE: MSE on integer counts has wrong scale (400 >> 1)
   
-  # KL annealing - Reduced free bits to enable some regularization
-  kl_warmup_epochs: 15           # Gradual warmup over 15 epochs
-  kl_free_bits: 3.0              # REDUCE 5.0→3.0: KL stuck at 0, need some regularization
-  kl_max_weight: 1.0             # Max multiplier for kl_divergence weight (0.3)  
+  # KL annealing - Cyclical schedule to prevent posterior collapse and KL explosion
+  kl_annealing_schedule: 'cyclical'  # Options: 'linear', 'cyclical'
+  kl_warmup_epochs: 12           # Warmup period within each cycle
+  kl_cycle_epochs: 30            # Full cycle length (warmup + plateau)
+  kl_free_bits: 2.0              # Minimum KL per latent dimension (prevents collapse)
+  kl_max_weight: 0.25            # REDUCED: Max multiplier for kl_divergence weight
+                                 # Effective max KL weight = 0.3 * 0.25 = 0.075
+                                 # This prevents KL from dominating reconstruction loss
 
   # Temperature annealing for Gumbel-Softmax
   initial_temperature: 5.0
