@@ -489,8 +489,9 @@ def main(args):
             model, train_loader, optimizer, scaler, config, epoch, writer, device
         )
         
-        # Validate
-        if epoch % 5 == 0:
+        # Validate - use config parameter
+        validate_every = config['training'].get('validate_every', 5)
+        if epoch % validate_every == 0:
             val_loss, val_losses_dict = validate(model, val_loader, config, epoch, writer, device)
             print(f"\nEpoch {epoch}:")
             print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
@@ -521,8 +522,9 @@ def main(args):
                 }, os.path.join(args.save_dir, 'best_model.pt'))
                 print(f"Saved best model (val_loss: {val_loss:.4f})")
         
-        # Save checkpoint
-        if epoch % 20 == 0:
+        # Save checkpoint - use config parameter
+        save_every = config['training'].get('save_every', 20)
+        if epoch % save_every == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
