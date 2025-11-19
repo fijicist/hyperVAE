@@ -119,14 +119,15 @@ class BipartiteHyperVAE(nn.Module):
         self.w_angular = self.loss_config.get('w_angular', 1.0)
         self.w_momentum = self.loss_config.get('w_momentum', 1.0)
         
-        # For 'euclidean_4d': weight energy vs spatial momentum
-        # D² = w_energy*(ΔE)² + (Δpx)² + (Δpy)² + (Δpz)²
-        self.w_energy = self.loss_config.get('w_energy', 0.5)  # Weight for energy component
-        
         # === pT-weighted Chamfer Loss ===
         # Option to weight particle matching by transverse momentum (high-pT particles more important)
         self.use_pt_weighting = self.loss_config.get('use_pt_weighting', True)
         self.pt_weight_alpha = self.loss_config.get('pt_weight_alpha', 1.0)  # α in w_i = pt_i^α
+        
+        # === Hyperbolic Chamfer Loss ===
+        # Hyperparameter for hyperbolic transformation: d_hyp = arcosh(1 + α * d²)
+        # Controls curvature of hyperbolic space; higher α → stronger hyperbolic effect
+        self.hyperbolic_alpha = self.loss_config.get('hyperbolic_alpha', 1.0)
         
         # === Squared vs Euclidean Distance ===
         # CRITICAL: Prevents gradient vanishing for far predictions
@@ -425,6 +426,8 @@ class BipartiteHyperVAE(nn.Module):
             # Training mode: use Chamfer Distance
             if self.particle_loss_type == 'chamfer':
                 return self._chamfer_distance_loss(batch, pred_features, pred_mask)
+            elif self.particle_loss_type == 'hyperbolic_chamfer':
+                return self._hyperbolic_chamfer_distance_loss(batch, pred_features, pred_mask)
             else:
                 return self._mse_particle_loss(batch, pred_features, pred_mask)
         else:
@@ -433,6 +436,8 @@ class BipartiteHyperVAE(nn.Module):
                 return self._wasserstein_particle_loss(batch, pred_features, pred_mask)
             elif self.evaluation_metric == 'chamfer':
                 return self._chamfer_distance_loss(batch, pred_features, pred_mask)
+            elif self.evaluation_metric == 'hyperbolic_chamfer':
+                return self._hyperbolic_chamfer_distance_loss(batch, pred_features, pred_mask)
             else:
                 return self._mse_particle_loss(batch, pred_features, pred_mask)
     
@@ -445,9 +450,9 @@ class BipartiteHyperVAE(nn.Module):
         1. 'rapidity_phi': Physics-motivated distance with angular and momentum components
            D(i,j) = sqrt[w_angular × [(Δη)² + (Δφ_wrapped)²] + w_momentum × [(Δlog_pt)² + (Δlog_E)²]]
         
-        2. 'euclidean_4d': Weighted 4D Euclidean distance for 4-vectors [E, px, py, pz]
-           D(i,j) = sqrt[w_energy×(E_i-E_j)² + (px_i-px_j)² + (py_i-py_j)² + (pz_i-pz_j)²]
-           All positive signs (Euclidean metric, not Minkowski)
+        2. 'euclidean_4d': W4D Euclidean distance for 4-vectors [E, px, py, pz]
+           D(i,j) = sqrt[(E_i-E_j)² + (px_i-px_j)² + (py_i-py_j)² + (pz_i-pz_j)²]
+           All positive signs (Euclidean metric)
         
         3. default: Standard Euclidean distance
         
@@ -503,7 +508,7 @@ class BipartiteHyperVAE(nn.Module):
             # EUCLIDEAN 4D DISTANCE FOR L-GATr 4-VECTORS [E, px, py, pz]
             # =====================================================================
             # Mathematical Form:
-            #   D²(i,j) = w_energy×(E_i-E_j)² + (px_i-px_j)² + (py_i-py_j)² + (pz_i-pz_j)²
+            #   D²(i,j) = (E_i-E_j)² + (px_i-px_j)² + (py_i-py_j)² + (pz_i-pz_j)²
             #   D(i,j) = √D²(i,j)  OR  D(i,j) = D²(i,j) if use_squared_distance=True
             # 
             # Key Design Decisions:
@@ -511,10 +516,9 @@ class BipartiteHyperVAE(nn.Module):
             #    - Minkowski: m² = E² - p² (can be negative)
             #    - Euclidean: always positive, suitable for distance metrics
             # 
-            # 2. WEIGHTED ENERGY COMPONENT
-            #    - w_energy typically > 1.0 (e.g., 2.0) to emphasize energy matching
-            #    - Momentum components have implicit weight 1.0
-            #    - Prevents model from ignoring energy by focusing only on spatial momentum
+            # 2. EQUAL WEIGHTING FOR ALL COMPONENTS
+            #    - All components (E, px, py, pz) treated equally with weight 1.0
+            #    - Standard Euclidean distance in 4D space
             # 
             # 3. SQUARED VS EUCLIDEAN DISTANCE (controlled by use_squared_distance)
             #    ┌──────────────┬──────────────┬────────────────────────┐
@@ -561,25 +565,15 @@ class BipartiteHyperVAE(nn.Module):
             delta_py_sq = (py1 - py2) ** 2   # [N1, N2] - y-momentum component
             delta_pz_sq = (pz1 - pz2) ** 2   # [N1, N2] - z-momentum component
             
-            # Compute weighted squared distance
-            # Note: w_energy scales energy, spatial momenta have implicit weight 1.0
-            dist_sq = self.w_energy * delta_E_sq + delta_px_sq + delta_py_sq + delta_pz_sq
+            # Compute unweighted squared distance (all components treated equally)
+            dist_sq = delta_E_sq + delta_px_sq + delta_py_sq + delta_pz_sq
             
-            # === CRITICAL DECISION: Squared vs Euclidean Distance ===
-            # This choice dramatically affects gradient flow and training dynamics
+            # Squared vs Euclidean Distance ===
             if self.use_squared_distance:
                 # SQUARED DISTANCE: D²(i,j) = Σ (x_i - x_j)²
-                # Gradient: ∂D²/∂x = 2(x_i - x_j) = 2x  (linear in error)
-                # Pro: Strong gradients even for large errors → faster learning
-                # Pro: Consistent across training and validation
-                # Con: Different scale than literature (need to mention in paper)
                 dist = torch.clamp(dist_sq, min=1e-8)  # Clamp for numerical stability
             else:
                 # EUCLIDEAN DISTANCE: D(i,j) = √[Σ (x_i - x_j)²]
-                # Gradient: ∂D/∂x = (x_i - x_j)/√[Σ(x_i - x_j)²] = x/D
-                # Pro: Standard metric in literature (easier to compare)
-                # Con: Vanishing gradients for far predictions (x/10 ≈ 0.1x)
-                # Con: Can cause training plateau in early epochs
                 dist = torch.sqrt(torch.clamp(dist_sq, min=1e-8))  # sqrt after clamp for stability
             
             return dist
@@ -745,6 +739,152 @@ class BipartiteHyperVAE(nn.Module):
                 pred_to_true = distances.min(dim=0)[0].mean()
             
             # Chamfer distance is sum of both directions
+            batch_loss = true_to_pred + pred_to_true
+            
+            # Check for NaN
+            if not torch.isnan(batch_loss):
+                total_loss += batch_loss
+                valid_count += 1
+            
+            cumulative_particles += n_true
+        
+        return total_loss / max(valid_count, 1)
+    
+    def _hyperbolic_chamfer_distance_loss(self, batch, pred_features, pred_mask):
+        """
+        Hyperbolic Chamfer Distance for particle reconstruction.
+        
+        Uses hyperbolic geometry transformation to map Euclidean distances to hyperbolic space.
+        This has been shown to better capture hierarchical and physical structures in particle jets
+        (see paper: arXiv:2412.17951).
+        
+        Mathematical Formulation:
+        -------------------------
+        1. Compute Euclidean distance between particles:
+           d_E(p_i, p_j) = ||p_i - p_j||  (using configured metric: rapidity_phi or euclidean_4d)
+        
+        2. Transform to hyperbolic distance:
+           d_H(p_i, p_j) = arcosh(1 + α × d_E²(p_i, p_j))
+           
+           where α (self.hyperbolic_alpha) controls the curvature:
+           - α → 0: recovers standard Euclidean (Chamfer) distance
+           - α > 0: stronger hyperbolic effect, emphasizes larger distances
+        
+        3. Bidirectional matching (same as standard Chamfer):
+           L = L_true→pred + L_pred→true
+           
+           L_true→pred = Σ_i w_i × min_j d_H(true_i, pred_j)
+           L_pred→true = Σ_j w_j × min_i d_H(pred_j, true_i)
+           
+           where w_i are pT-based weights (if use_pt_weighting=True):
+           w_i = (pT_i)^α / Σ_k (pT_k)^α
+        
+        Key Properties:
+        ---------------
+        - Permutation invariant (set-valued matching)
+        - Handles variable cardinality (n_true ≠ n_pred)
+        - Compatible with pT-weighting
+        - Differentiable everywhere (arcosh is smooth for x > 1)
+        - Emphasizes large distances more than standard Chamfer
+        
+        Args:
+            batch: PyG Batch with true particle features (batch.x)
+            pred_features: [batch_size, max_particles, F] predicted particle features
+            pred_mask: [batch_size, max_particles] binary mask for valid predictions
+        
+        Returns:
+            torch.Tensor: Scalar hyperbolic Chamfer loss averaged over batch
+        
+        Implementation Notes:
+        --------------------
+        - For numerical stability: arcosh(x) = log(x + sqrt(x² - 1)) with clipping x > 1+ε
+        - pT-weighting uses log_pt features: pt^α = exp(α × log_pt)
+        - Processes jets independently (no inter-jet matching)
+        - Skips jets with zero particles or invalid predictions
+        """
+        true_features = batch.x
+        
+        batch_size = batch.num_graphs
+        total_loss = 0.0
+        valid_count = 0
+        
+        cumulative_particles = 0
+        for i in range(batch_size):
+            n_true = batch.n_particles[i].item()
+            if n_true == 0:
+                continue
+            
+            # Extract true particles for this jet
+            true_particles = true_features[cumulative_particles:cumulative_particles + n_true]
+            
+            # Extract predicted particles using mask
+            if pred_mask is not None:
+                if not self.training:
+                    # Validation/test: use binary mask with threshold
+                    valid_pred_mask = (pred_mask[i] > 0.5)
+                    
+                    n_pred = valid_pred_mask.sum().item()
+                    if n_pred == 0:
+                        # No particles passed threshold - use top-k
+                        k = min(n_true, pred_mask[i].size(0))
+                        _, top_indices = torch.topk(pred_mask[i], k)
+                        valid_pred_mask = torch.zeros_like(pred_mask[i], dtype=torch.bool)
+                        valid_pred_mask[top_indices] = True
+                    
+                    pred_particles = pred_features[i][valid_pred_mask]
+                else:
+                    # Training: assume first n_true are valid
+                    pred_particles = pred_features[i, :n_true]
+            else:
+                pred_particles = pred_features[i, :n_true]
+            
+            if pred_particles.shape[0] == 0:
+                cumulative_particles += n_true
+                continue
+            
+            # Compute Euclidean pairwise distances [n_true, n_pred]
+            euclidean_distances = self._compute_particle_distance(true_particles, pred_particles)
+            
+            # Transform to hyperbolic distances: d_hyp = arcosh(1 + α × d_E²)
+            # IMPORTANT: Formula requires d², but _compute_particle_distance may return d or d²
+            # depending on use_squared_distance config. Handle both cases correctly.
+            if self.use_squared_distance:
+                # Distance metric already returns d², use directly
+                euclidean_distances_sq = euclidean_distances
+            else:
+                # Distance metric returns d, square it for hyperbolic formula
+                euclidean_distances_sq = euclidean_distances ** 2
+            
+            # Hyperbolic transformation with α hyperparameter
+            hyperbolic_arg = 1.0 + self.hyperbolic_alpha * euclidean_distances_sq
+            # Clamp to avoid numerical issues (arcosh requires x > 1)
+            hyperbolic_arg = torch.clamp(hyperbolic_arg, min=1.0 + 1e-8)
+            hyperbolic_distances = torch.acosh(hyperbolic_arg)
+            
+            if self.use_pt_weighting:
+                # Compute pT-based weights: w_i = (pT_i)^α / Σ (pT_k)^α
+                true_log_pt = true_particles[:, self.log_pt_index]
+                pred_log_pt = pred_particles[:, self.log_pt_index]
+                
+                # pt^α = exp(α × log_pt)
+                true_weights = torch.exp(self.pt_weight_alpha * true_log_pt)
+                true_weights = true_weights / (true_weights.sum() + 1e-8)
+                
+                pred_weights = torch.exp(self.pt_weight_alpha * pred_log_pt)
+                pred_weights = pred_weights / (pred_weights.sum() + 1e-8)
+                
+                # Weighted hyperbolic Chamfer distance
+                true_to_pred_min = hyperbolic_distances.min(dim=1)[0]
+                true_to_pred = (true_weights * true_to_pred_min).sum()
+                
+                pred_to_true_min = hyperbolic_distances.min(dim=0)[0]
+                pred_to_true = (pred_weights * pred_to_true_min).sum()
+            else:
+                # Unweighted hyperbolic Chamfer distance
+                true_to_pred = hyperbolic_distances.min(dim=1)[0].mean()
+                pred_to_true = hyperbolic_distances.min(dim=0)[0].mean()
+            
+            # Bidirectional hyperbolic Chamfer loss
             batch_loss = true_to_pred + pred_to_true
             
             # Check for NaN

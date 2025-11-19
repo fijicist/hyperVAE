@@ -158,8 +158,8 @@ training:
   
   # Loss function configuration
   loss_config:
-    particle_loss_type: "chamfer"  # Options: "chamfer", "mse"
-    particle_distance_metric: "euclidean_4d"  # Weighted 4D Euclidean distance for [E, px, py, pz]
+    particle_loss_type: "hyperbolic_chamfer"  # Options: "chamfer", "hyperbolic_chamfer", "mse"
+    particle_distance_metric: "euclidean_4d"  # Standard 4D Euclidean distance for [E, px, py, pz]
     
     # Particle feature indices [E, px, py, pz]
     E_index: 0                  # Index of energy E in particle features
@@ -167,22 +167,24 @@ training:
     py_index: 2                 # Index of py momentum component
     pz_index: 3                 # Index of pz momentum component
     
-    # Chamfer distance weights for 4D Euclidean metric
-    # D(i,j) = w_energy×(E_i-E_j)² + (px_i-px_j)² + (py_i-py_j)² + (pz_i-pz_j)²
-    # All positive signs (Euclidean metric), momentum components have implicit weight 1.0
-    w_energy: 2               # Weight for energy component
-    
-    # Squared distance vs Euclidean distance
+    # Squared distance vs Euclidean distance for usual Chamfer distance
     # Squared (d²): Strong gradients (∇d² = 2x), consistent training/val, faster computation
     # Euclidean (√d²): Standard metric but vanishing gradients for large errors (∇√d² = 1/(2√x))
     # Recommendation: Use squared for normalized features to avoid gradient plateau
     use_squared_distance: true   # Use squared distance for all epochs (training + validation)
     
+    # Hyperbolic Chamfer distance configuration
+    # Uses hyperbolic geometry transformation: d_hyp = arcosh(1 + α × d_E²)
+    # Paper: arXiv:2412.17951 shows hyperbolic Chamfer better captures jet structure
+    hyperbolic_alpha: 1.5        # Hyperparameter controlling hyperbolic curvature
+                                 # α → 0: recovers standard Chamfer
+                                 # α > 0: stronger hyperbolic effect, emphasizes large distances
+    
     # pT-weighted Chamfer loss
-    use_pt_weighting: false      # Enable pT-based weighting of Chamfer distance
+    use_pt_weighting: true      # Enable pT-based weighting of Chamfer distance
     pt_weight_alpha: 1.0        # Exponent for pT weighting: α=1.0 (linear), α=2.0 (quadratic)
     
-    evaluation_metric: "chamfer"  # Use chamfer for validation too (was "wasserstein" with wrong scale)
+    evaluation_metric: "hyperbolic_chamfer"  # Use chamfer for validation too (was "wasserstein" with wrong scale)
     
     # Jet-level feature indices in y tensor [jet_type, jet_pt, jet_eta, jet_mass, ...]
     jet_pt_index: 1             # Index of jet_pt in y tensor
@@ -197,10 +199,10 @@ training:
   
   # KL annealing - Cyclical schedule to prevent posterior collapse and KL explosion
   kl_annealing_schedule: 'cyclical'  # Options: 'linear', 'cyclical'
-  kl_warmup_epochs: 12           # Warmup period within each cycle
-  kl_cycle_epochs: 30            # Full cycle length (warmup + plateau)
-  kl_free_bits: 2.0              # Minimum KL per latent dimension (prevents collapse)
-  kl_max_weight: 0.25            # REDUCED: Max multiplier for kl_divergence weight
+  kl_warmup_epochs: 8           # Warmup period within each cycle
+  kl_cycle_epochs: 25            # Full cycle length (warmup + plateau)
+  kl_free_bits: 1.5              # Minimum KL per latent dimension (prevents collapse)
+  kl_max_weight: 0.12            # REDUCED: Max multiplier for kl_divergence weight
                                  # Effective max KL weight = 0.3 * 0.25 = 0.075
                                  # This prevents KL from dominating reconstruction loss
 
