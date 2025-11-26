@@ -395,6 +395,28 @@ def main(args):
         train_dataset = BipartiteJetDataset(generate_dummy=True)
         val_dataset = BipartiteJetDataset(generate_dummy=True)
     
+    # Create custom collate function that adds normalization statistics
+    def collate_with_stats(data_list):
+        """Wrapper around collate_bipartite_batch that adds normalization statistics"""
+        batch = collate_bipartite_batch(data_list)
+        
+        # Get the base dataset (unwrap if it's a Subset)
+        base_dataset = train_dataset
+        if isinstance(train_dataset, torch.utils.data.Subset):
+            base_dataset = train_dataset.dataset
+        
+        # Attach normalization statistics from dataset to batch
+        if hasattr(base_dataset, 'particle_norm_stats') and base_dataset.particle_norm_stats is not None:
+            batch.particle_norm_stats = base_dataset.particle_norm_stats
+        if hasattr(base_dataset, 'jet_norm_stats') and base_dataset.jet_norm_stats is not None:
+            batch.jet_norm_stats = base_dataset.jet_norm_stats
+        if hasattr(base_dataset, 'edge_norm_stats') and base_dataset.edge_norm_stats is not None:
+            batch.edge_norm_stats = base_dataset.edge_norm_stats
+        if hasattr(base_dataset, 'hyperedge_norm_stats') and base_dataset.hyperedge_norm_stats is not None:
+            batch.hyperedge_norm_stats = base_dataset.hyperedge_norm_stats
+        
+        return batch
+    
     # Create loaders
     train_loader = DataLoader(
         train_dataset,
@@ -402,7 +424,7 @@ def main(args):
         shuffle=True,
         num_workers=config['data']['num_workers'],
         pin_memory=config['data']['pin_memory'],
-        collate_fn=collate_bipartite_batch,
+        collate_fn=collate_with_stats,
         prefetch_factor=config['data']['prefetch_factor']
     )
     
@@ -412,7 +434,7 @@ def main(args):
         shuffle=False,
         num_workers=config['data']['num_workers'],
         pin_memory=config['data']['pin_memory'],
-        collate_fn=collate_bipartite_batch
+        collate_fn=collate_with_stats
     )
     
     # Create model

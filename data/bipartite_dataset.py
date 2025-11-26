@@ -89,6 +89,13 @@ class BipartiteJetDataset(Dataset):
         """
         self.max_particles = max_particles
         
+        # Normalization statistics (extracted from graph_constructor.py output)
+        # These are the same for all samples since normalization was done globally
+        self.particle_norm_stats = None
+        self.jet_norm_stats = None
+        self.edge_norm_stats = None
+        self.hyperedge_norm_stats = None
+        
         if generate_dummy:
             self.data = self._generate_dummy_data(num_samples=num_samples)
         elif data_path:
@@ -110,6 +117,24 @@ class BipartiteJetDataset(Dataset):
             raise ValueError(f"Expected list of Data objects, got {type(data_list)}")
         
         print(f"Loaded {len(data_list)} jets")
+        
+        # Extract normalization statistics from first graph (they're the same for all)
+        if len(data_list) > 0:
+            first_graph = data_list[0]
+            
+            # Store normalization statistics at dataset level
+            if hasattr(first_graph, 'particle_norm_stats'):
+                self.particle_norm_stats = first_graph.particle_norm_stats
+                print(f"Extracted particle normalization statistics")
+            if hasattr(first_graph, 'jet_norm_stats'):
+                self.jet_norm_stats = first_graph.jet_norm_stats
+                print(f"Extracted jet normalization statistics")
+            if hasattr(first_graph, 'edge_norm_stats'):
+                self.edge_norm_stats = first_graph.edge_norm_stats
+                print(f"Extracted edge normalization statistics")
+            if hasattr(first_graph, 'hyperedge_norm_stats'):
+                self.hyperedge_norm_stats = first_graph.hyperedge_norm_stats
+                print(f"Extracted hyperedge normalization statistics")
         
         # Validate first sample
         if len(data_list) > 0:
@@ -306,7 +331,18 @@ class BipartiteJetDataset(Dataset):
 
 
 def collate_bipartite_batch(data_list):
-    """Custom collate function for bipartite graphs"""
+    """
+    Custom collate function for bipartite graphs.
+    
+    Note: Normalization statistics are added in train.py via a wrapper function
+    that accesses the dataset object directly.
+    
+    Args:
+        data_list: List of PyG Data objects
+    
+    Returns:
+        PyG Batch object
+    """
     batch = Batch.from_data_list(data_list)
     return batch
 

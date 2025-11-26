@@ -1463,10 +1463,11 @@ class BipartiteHyperVAE(nn.Module):
         
         # === PARALLEL REDUCTION (scatter_add for per-jet sums) ===
         # Sum particles by jet using scatter_add (GPU-optimized parallel reduction)
-        E_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, E_phys)
-        px_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, px_phys)
-        py_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, py_phys)
-        pz_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, pz_phys)
+        # Match dtype of input tensors for scatter_add compatibility
+        E_sum = torch.zeros(batch_size, device=device, dtype=E_phys.dtype).scatter_add_(0, valid_batch_indices, E_phys)
+        px_sum = torch.zeros(batch_size, device=device, dtype=px_phys.dtype).scatter_add_(0, valid_batch_indices, px_phys)
+        py_sum = torch.zeros(batch_size, device=device, dtype=py_phys.dtype).scatter_add_(0, valid_batch_indices, py_phys)
+        pz_sum = torch.zeros(batch_size, device=device, dtype=pz_phys.dtype).scatter_add_(0, valid_batch_indices, pz_phys)
         
         # Count valid particles per jet (for filtering jets with zero particles)
         valid_count = torch.zeros(batch_size, device=device, dtype=torch.int32).scatter_add_(
