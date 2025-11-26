@@ -156,6 +156,13 @@ class BipartiteHyperVAE(nn.Module):
         self.use_auxiliary_losses = config['model'].get('use_auxiliary_losses', True)
         self.auxiliary_loss_weight = config['model'].get('auxiliary_loss_weight', 0.1)  # Typically 0.1
         
+        # === Local→Global Physics Consistency Loss ===
+        # Enforces agreement between particle 4-momenta and jet-level observables
+        self.use_consistency_loss = self.loss_config.get('use_consistency_loss', True)
+        self.consistency_pt_weight = self.loss_config.get('consistency_pt_weight', 2.0)
+        self.consistency_eta_weight = self.loss_config.get('consistency_eta_weight', 1.0)
+        self.consistency_mass_weight = self.loss_config.get('consistency_mass_weight', 2.5)
+        
         # === Regularization ===
         # Latent noise during training (variational dropout for robustness)
         self.latent_noise_std = config['training'].get('latent_noise', 0.0)
@@ -290,25 +297,28 @@ class BipartiteHyperVAE(nn.Module):
     
     def compute_loss(self, batch, output, epoch=0):
         """
-        Compute total VAE loss: Reconstruction + KL Divergence + Auxiliary Losses.
+        Compute total VAE loss: Reconstruction + KL Divergence + Auxiliary Losses + Physics Consistency.
         
         Loss Formulation:
-            L_total = L_particle + w_aux * (L_edge + L_hyperedge) + w_jet * L_jet + β(epoch) * L_KL
+            L_total = L_particle + w_aux * (L_edge + L_hyperedge) + w_jet * L_jet + 
+                      w_cons * L_consistency + β(epoch) * L_KL
         
         Where:
         - L_particle: Chamfer distance between true and predicted particles (MAIN LOSS)
         - L_edge: MSE for pairwise edge features (ln_delta, ln_kt, etc.)
         - L_hyperedge: MSE for higher-order features (3pt_eec, 4pt_eec)
         - L_jet: Weighted MSE for jet-level features (jet_pt, jet_eta, jet_mass, n_constituents)
+        - L_consistency: Local→global physics consistency (particles sum to jet observables)
         - L_KL: KL divergence between q(z|x) and p(z)=N(0,I)
         - β(epoch): KL annealing weight (gradually increases from 0 to 1)
         
         Loss Weights:
-        - particle_features: 1.0 (main objective)
-        - edge_features: 0.1 * w_aux (auxiliary)
-        - hyperedge_features: 0.1 * w_aux (auxiliary)
-        - jet_features: 1.0 (constrain jet-level properties)
-        - kl_divergence: β(epoch) (annealed to prevent posterior collapse)
+        - particle_features: 12000.0 (main objective)
+        - edge_features: 2500.0 * w_aux (auxiliary)
+        - hyperedge_features: 1500.0 * w_aux (auxiliary)
+        - jet_features: 6000.0 (constrain jet-level properties)
+        - local_global_consistency: 3000.0 (physics constraint)
+        - kl_divergence: 0.3 * β(epoch) (annealed regularization)
         
         Args:
             batch: PyG Batch with ground truth data
@@ -321,6 +331,7 @@ class BipartiteHyperVAE(nn.Module):
                 - 'edge': Edge reconstruction loss (0 if disabled)
                 - 'hyperedge': Hyperedge reconstruction loss (0 if disabled)
                 - 'jet': Jet feature loss
+                - 'consistency': Local→global physics consistency loss
                 - 'kl': KL divergence
                 - 'kl_weight': Current KL annealing weight β(epoch)
                 - 'kl_raw': Raw KL before weighting (for monitoring)
@@ -372,7 +383,17 @@ class BipartiteHyperVAE(nn.Module):
         jet_loss = self._jet_feature_loss(batch, output['jet_features'], output['topology'])
         losses['jet'] = jet_loss
         
-        # 5. KL divergence
+        # 5. Local→Global Physics Consistency Loss
+        # Enforces that generated particles sum to correct jet-level observables
+        if self.use_consistency_loss:
+            consistency_loss = self._local_global_consistency_loss(
+                batch, output['particle_features'], output['topology']['particle_mask']
+            )
+            losses['consistency'] = consistency_loss
+        else:
+            losses['consistency'] = torch.tensor(0.0, device=batch.x.device)
+        
+        # 6. KL divergence
         kl_loss = self._kl_divergence(output['mu'], output['logvar'])
         
         # KL annealing with cyclical schedule support
@@ -407,6 +428,7 @@ class BipartiteHyperVAE(nn.Module):
             self.auxiliary_loss_weight * self.loss_weights['edge_features'] * losses['edge'] +
             self.auxiliary_loss_weight * self.loss_weights['hyperedge_features'] * losses['hyperedge'] +
             self.loss_weights['jet_features'] * losses['jet'] +
+            self.loss_weights.get('local_global_consistency', 0.0) * losses['consistency'] +
             self.loss_weights['kl_divergence'] * kl_weight * losses['kl']
         )
         
@@ -713,16 +735,38 @@ class BipartiteHyperVAE(nn.Module):
             distances = self._compute_particle_distance(true_particles, pred_particles)
             
             if self.use_pt_weighting:
-                # Compute pT-based weights: w_i = exp(log_pt_i)^α / Σ exp(log_pt_k)^α
-                # exp(log_pt)^α = exp(α * log_pt) = pt^α
-                true_log_pt = true_particles[:, self.log_pt_index]  # [n_true]
-                pred_log_pt = pred_particles[:, self.log_pt_index]  # [n_pred]
+                # Compute pT-based weights: w_i = (pT_i)^α / Σ (pT_k)^α
+                # pT = sqrt(px² + py²) computed from denormalized momenta
                 
-                # Compute weights: pt^α normalized
-                true_weights = torch.exp(self.pt_weight_alpha * true_log_pt)  # [n_true]
+                # Get normalization stats
+                px_stats = batch.particle_norm_stats['px']
+                py_stats = batch.particle_norm_stats['py']
+                
+                # Denormalize px and py efficiently based on normalization method
+                if px_stats['method'] == 'zscore':
+                    # Z-score: x = x_norm * std + mean
+                    true_px = true_particles[:, self.px_index] * px_stats['std'] + px_stats['mean']
+                    true_py = true_particles[:, self.py_index] * py_stats['std'] + py_stats['mean']
+                    pred_px = pred_particles[:, self.px_index] * px_stats['std'] + px_stats['mean']
+                    pred_py = pred_particles[:, self.py_index] * py_stats['std'] + py_stats['mean']
+                else:  # minmax
+                    # Min-max: x = x_norm * (max - min) + min
+                    px_range = px_stats['max'] - px_stats['min']
+                    py_range = py_stats['max'] - py_stats['min']
+                    true_px = true_particles[:, self.px_index] * px_range + px_stats['min']
+                    true_py = true_particles[:, self.py_index] * py_range + py_stats['min']
+                    pred_px = pred_particles[:, self.px_index] * px_range + px_stats['min']
+                    pred_py = pred_particles[:, self.py_index] * py_range + py_stats['min']
+                
+                # Compute pT = sqrt(px² + py²)
+                true_pt = torch.sqrt(true_px ** 2 + true_py ** 2 + 1e-8)  # [n_true]
+                pred_pt = torch.sqrt(pred_px ** 2 + pred_py ** 2 + 1e-8)  # [n_pred]
+                
+                # Compute normalized weights: w_i = (pT_i)^α / Σ (pT_k)^α
+                true_weights = true_pt ** self.pt_weight_alpha  # [n_true]
                 true_weights = true_weights / (true_weights.sum() + 1e-8)
                 
-                pred_weights = torch.exp(self.pt_weight_alpha * pred_log_pt)  # [n_pred]
+                pred_weights = pred_pt ** self.pt_weight_alpha  # [n_pred]
                 pred_weights = pred_weights / (pred_weights.sum() + 1e-8)
                 
                 # Weighted Chamfer Distance:
@@ -863,14 +907,37 @@ class BipartiteHyperVAE(nn.Module):
             
             if self.use_pt_weighting:
                 # Compute pT-based weights: w_i = (pT_i)^α / Σ (pT_k)^α
-                true_log_pt = true_particles[:, self.log_pt_index]
-                pred_log_pt = pred_particles[:, self.log_pt_index]
+                # pT = sqrt(px² + py²) computed from denormalized momenta
                 
-                # pt^α = exp(α × log_pt)
-                true_weights = torch.exp(self.pt_weight_alpha * true_log_pt)
+                # Get normalization stats
+                px_stats = batch.particle_norm_stats['px']
+                py_stats = batch.particle_norm_stats['py']
+                
+                # Denormalize px and py efficiently based on normalization method
+                if px_stats['method'] == 'zscore':
+                    # Z-score: x = x_norm * std + mean
+                    true_px = true_particles[:, self.px_index] * px_stats['std'] + px_stats['mean']
+                    true_py = true_particles[:, self.py_index] * py_stats['std'] + py_stats['mean']
+                    pred_px = pred_particles[:, self.px_index] * px_stats['std'] + px_stats['mean']
+                    pred_py = pred_particles[:, self.py_index] * py_stats['std'] + py_stats['mean']
+                else:  # minmax
+                    # Min-max: x = x_norm * (max - min) + min
+                    px_range = px_stats['max'] - px_stats['min']
+                    py_range = py_stats['max'] - py_stats['min']
+                    true_px = true_particles[:, self.px_index] * px_range + px_stats['min']
+                    true_py = true_particles[:, self.py_index] * py_range + py_stats['min']
+                    pred_px = pred_particles[:, self.px_index] * px_range + px_stats['min']
+                    pred_py = pred_particles[:, self.py_index] * py_range + py_stats['min']
+                
+                # Compute pT = sqrt(px² + py²)
+                true_pt = torch.sqrt(true_px ** 2 + true_py ** 2 + 1e-8)  # [n_true]
+                pred_pt = torch.sqrt(pred_px ** 2 + pred_py ** 2 + 1e-8)  # [n_pred]
+                
+                # Compute normalized weights: w_i = (pT_i)^α / Σ (pT_k)^α
+                true_weights = true_pt ** self.pt_weight_alpha  # [n_true]
                 true_weights = true_weights / (true_weights.sum() + 1e-8)
                 
-                pred_weights = torch.exp(self.pt_weight_alpha * pred_log_pt)
+                pred_weights = pred_pt ** self.pt_weight_alpha  # [n_pred]
                 pred_weights = pred_weights / (pred_weights.sum() + 1e-8)
                 
                 # Weighted hyperbolic Chamfer distance
@@ -1241,6 +1308,253 @@ class BipartiteHyperVAE(nn.Module):
             jet_loss = torch.tensor(0.0, device=pred_jet_features.device)
         
         return jet_loss
+    
+    def _local_global_consistency_loss(self, batch, pred_features, pred_mask):
+        """
+        Compute local→global physics consistency loss.
+        
+        ═══════════════════════════════════════════════════════════════════════
+        LOCAL→GLOBAL PHYSICS CONSISTENCY LOSS
+        ═══════════════════════════════════════════════════════════════════════
+        
+        Purpose:
+        --------
+        Enforce agreement between generated particle 4-momenta and true jet-level
+        observables by computing jet properties from particles and comparing to truth.
+        
+        This is a PHYSICS CONSTRAINT that ensures:
+        1. Energy-momentum conservation: Σ particles ≈ jet 4-momentum
+        2. Kinematic consistency: pT, η, mass computed from constituents match truth
+        3. Multi-scale correctness: Local (particles) and global (jet) views agree
+        
+        Mathematical Formulation:
+        -------------------------
+        1. Denormalize particle 4-vectors [E, px, py, pz] from normalized predictions
+        2. Sum particle momenta to compute jet-level observables:
+           - pT_sum = √(Σpx)² + (Σpy)²
+           - m_sum = √(ΣE)² - (Σpx)² - (Σpy)² - (Σpz)²
+           - η_sum = asinh(Σpz / (pT_sum + ε))
+        
+        3. Compare to true jet observables using normalized residuals:
+           - e_pT = (pT_sum - pT_true) / σ_pT
+           - e_η = (η_sum - η_true) / σ_η
+           - e_m = (m_sum - m_true) / σ_m
+        
+        4. Weighted MSE loss:
+           L_cons = w_pT × 𝔼[e_pT²] + w_η × 𝔼[e_η²] + w_m × 𝔼[e_m²]
+        
+        Workflow:
+        ---------
+        1. Extract predicted particles (respecting masks for valid particles)
+        2. Denormalize using batch.particle_norm_stats (supports zscore and minmax)
+        3. Sum 4-momenta per jet
+        4. Compute jet observables (pT, η, m) from sums
+        5. Denormalize true jet features from batch.y using batch.jet_norm_stats
+        6. Compute normalized residuals using jet-level σ values
+        7. Weighted MSE of residuals
+        
+        Args:
+            batch: PyG Batch with:
+                - x: [N_particles_total, 4] true particle features (for reference, not used here)
+                - y: [batch_size, 4] true jet features [jet_type, log_pt, eta, log_mass]
+                - particle_norm_stats: {'E': stats, 'px': stats, 'py': stats, 'pz': stats}
+                - jet_norm_stats: {'pt': stats, 'eta': stats, 'mass': stats}
+                - n_particles: [batch_size] true particle counts per jet
+                - batch: [N_particles_total] batch assignment vector
+                
+            pred_features: [batch_size, max_particles, 4] predicted normalized particles
+            pred_mask: [batch_size, max_particles] validity mask (0-1 soft, or bool)
+        
+        Returns:
+            torch.Tensor: Scalar consistency loss averaged over batch
+        """
+        batch_size = batch.num_graphs
+        device = pred_features.device
+        
+        # Avoid repeated dict lookups
+        particle_norm_stats = batch.particle_norm_stats
+        jet_norm_stats = batch.jet_norm_stats
+        
+        E_stats = particle_norm_stats['E']
+        px_stats = particle_norm_stats['px']
+        py_stats = particle_norm_stats['py']
+        pz_stats = particle_norm_stats['pz']
+        
+        pt_stats = jet_norm_stats['pt']
+        eta_stats = jet_norm_stats['eta']
+        mass_stats = jet_norm_stats['mass']
+        
+        # Check normalization method once (same for all components)
+        is_zscore = E_stats['method'] == 'zscore'
+        
+        # Extract valid particle mask
+        if pred_mask is not None:
+            if pred_mask.dtype == torch.bool:
+                valid_mask = pred_mask  # [batch_size, max_particles]
+            else:
+                valid_mask = pred_mask > 0.5  # Threshold soft mask
+        else:
+            # Fallback: assume all particles valid (shouldn't happen)
+            valid_mask = torch.ones_like(pred_features[..., 0], dtype=torch.bool)
+        
+        # Flatten batch dimension: [batch_size, max_particles, 4] → [batch_size*max_particles, 4]
+        pred_features_flat = pred_features.reshape(-1, 4)  # [B*M, 4]
+        valid_mask_flat = valid_mask.reshape(-1)  # [B*M]
+        
+        # Create batch indices for scatter operations
+        # batch_indices[i] tells which jet particle i belongs to
+        max_particles = pred_features.shape[1]
+        batch_indices = torch.arange(batch_size, device=device).repeat_interleave(max_particles)  # [B*M]
+        
+        # Filter to valid particles only
+        valid_particles = pred_features_flat[valid_mask_flat]  # [N_valid, 4]
+        valid_batch_indices = batch_indices[valid_mask_flat]  # [N_valid]
+        
+        # Early exit if no valid particles
+        if valid_particles.shape[0] == 0:
+            return torch.tensor(0.0, device=device)
+        
+        # Vectorized denormalization (all particles at once)
+        # Extract components (vectorized slice)
+        E_norm = valid_particles[:, self.E_index]    # [N_valid]
+        px_norm = valid_particles[:, self.px_index]  # [N_valid]
+        py_norm = valid_particles[:, self.py_index]  # [N_valid]
+        pz_norm = valid_particles[:, self.pz_index]  # [N_valid]
+        
+        # Denormalize based on method (single branch, applied to all)
+        if is_zscore:
+            # Z-score: x = x_norm * std + mean
+            E_phys = E_norm * E_stats['std'] + E_stats['mean']
+            px_phys = px_norm * px_stats['std'] + px_stats['mean']
+            py_phys = py_norm * py_stats['std'] + py_stats['mean']
+            pz_phys = pz_norm * pz_stats['std'] + pz_stats['mean']
+            
+            # Pre-compute jet denorm factors (for true jet denormalization)
+            pt_denorm_scale = pt_stats['std']
+            pt_denorm_offset = pt_stats['mean']
+            eta_denorm_scale = eta_stats['std']
+            eta_denorm_offset = eta_stats['mean']
+            mass_denorm_scale = mass_stats['std']
+            mass_denorm_offset = mass_stats['mean']
+            
+        else:  # minmax
+            # Min-max: x = x_norm * (max - min) + min
+            E_range = E_stats['max'] - E_stats['min']
+            px_range = px_stats['max'] - px_stats['min']
+            py_range = py_stats['max'] - py_stats['min']
+            pz_range = pz_stats['max'] - pz_stats['min']
+            
+            E_phys = E_norm * E_range + E_stats['min']
+            px_phys = px_norm * px_range + px_stats['min']
+            py_phys = py_norm * py_range + py_stats['min']
+            pz_phys = pz_norm * pz_range + pz_stats['min']
+            
+            # Pre-compute jet denorm factors (for true jet denormalization)
+            pt_range = pt_stats['max'] - pt_stats['min']
+            eta_range = eta_stats['max'] - eta_stats['min']
+            mass_range = mass_stats['max'] - mass_stats['min']
+            
+            pt_denorm_scale = pt_range
+            pt_denorm_offset = pt_stats['min']
+            eta_denorm_scale = eta_range
+            eta_denorm_offset = eta_stats['min']
+            mass_denorm_scale = mass_range
+            mass_denorm_offset = mass_stats['min']
+        
+        # === PARALLEL REDUCTION (scatter_add for per-jet sums) ===
+        # Sum particles by jet using scatter_add (GPU-optimized parallel reduction)
+        E_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, E_phys)
+        px_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, px_phys)
+        py_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, py_phys)
+        pz_sum = torch.zeros(batch_size, device=device).scatter_add_(0, valid_batch_indices, pz_phys)
+        
+        # Count valid particles per jet (for filtering jets with zero particles)
+        valid_count = torch.zeros(batch_size, device=device, dtype=torch.int32).scatter_add_(
+            0, valid_batch_indices, torch.ones_like(valid_batch_indices, dtype=torch.int32)
+        )
+        
+        # VECTORIZED JET OBSERVABLES 
+        # Transverse momentum: pT = √(px² + py²)
+        pred_jet_pt = torch.sqrt(px_sum ** 2 + py_sum ** 2 + 1e-8)  # [batch_size]
+        
+        # Invariant mass: m² = E² - p²
+        mass_sq = E_sum ** 2 - px_sum ** 2 - py_sum ** 2 - pz_sum ** 2
+        pred_jet_mass = torch.sqrt(torch.clamp(mass_sq, min=0.0) + 1e-8)  # [batch_size]
+        
+        # Pseudorapidity: η = asinh(pz / pT)
+        pred_jet_eta = torch.asinh(pz_sum / (pred_jet_pt + 1e-8))  # [batch_size]
+        
+        # === VECTORIZED TRUE JET DENORMALIZATION ===
+        # Extract normalized true jet features (all jets at once)
+        true_jet_pt_norm = batch.y[:, self.jet_pt_index]     # [batch_size]
+        true_jet_eta_norm = batch.y[:, self.jet_eta_index]   # [batch_size]
+        true_jet_mass_norm = batch.y[:, self.jet_mass_index] # [batch_size]
+        
+        # Denormalize (vectorized, already have scales/offsets)
+        true_jet_logpt = true_jet_pt_norm * pt_denorm_scale + pt_denorm_offset
+        true_jet_eta = true_jet_eta_norm * eta_denorm_scale + eta_denorm_offset
+        true_jet_logmass = true_jet_mass_norm * mass_denorm_scale + mass_denorm_offset
+        
+        # Apply exp to recover physical values from log
+        true_jet_pt = torch.exp(true_jet_logpt)
+        true_jet_mass = torch.exp(true_jet_logmass)
+        
+        # === COMPUTE RESIDUAL NORMALIZATION SCALES FROM PHYSICAL VALUES ===
+        # For proper normalization, compute std/range from ACTUAL physical distributions
+        if is_zscore:
+            # For z-score: use std of physical (exponentiated) values
+            # η is already physical, pT and mass are exponentiated from log-space
+            pt_residual_scale = true_jet_pt.std() + 1e-8      # std of exp(log_pt)
+            eta_residual_scale = eta_stats['std'] + 1e-8    # std of eta (already physical)
+            mass_residual_scale = true_jet_mass.std() + 1e-8  # std of exp(log_mass)
+        else:  # minmax
+            # For minmax: use range (max - min) of physical values
+            pt_residual_scale = (true_jet_pt.max() - true_jet_pt.min()) + 1e-8
+            eta_residual_scale = eta_stats['max'] - eta_stats['min'] + 1e-8
+            mass_residual_scale = (true_jet_mass.max() - true_jet_mass.min()) + 1e-8
+        
+        # === VECTORIZED RESIDUALS & MASKING ===
+        # Filter to jets with at least one valid particle
+        valid_jets_mask = valid_count > 0  # [batch_size]
+        
+        if not valid_jets_mask.any():
+            return torch.tensor(0.0, device=device)
+        
+        # Compute residuals (only for valid jets using masked operations)
+        residual_pt = (pred_jet_pt - true_jet_pt)[valid_jets_mask]
+        residual_eta = (pred_jet_eta - true_jet_eta)[valid_jets_mask]
+        residual_mass = (pred_jet_mass - true_jet_mass)[valid_jets_mask]
+        
+        # Normalize residuals (vectorized division, already have scales)
+        normalized_residual_pt = residual_pt / (pt_residual_scale + 1e-8)
+        normalized_residual_eta = residual_eta / (eta_residual_scale + 1e-8)
+        normalized_residual_mass = residual_mass / (mass_residual_scale + 1e-8)
+        
+        # Compute MSE and weight in one step (avoids storing intermediate tensors)
+        loss_pt = (normalized_residual_pt ** 2).mean()
+        loss_eta = (normalized_residual_eta ** 2).mean()
+        loss_mass = (normalized_residual_mass ** 2).mean()
+        
+        # NaN checks (use where to avoid branches)
+        loss_pt = torch.where(torch.isnan(loss_pt), torch.zeros_like(loss_pt), loss_pt)
+        loss_eta = torch.where(torch.isnan(loss_eta), torch.zeros_like(loss_eta), loss_eta)
+        loss_mass = torch.where(torch.isnan(loss_mass), torch.zeros_like(loss_mass), loss_mass)
+        
+        # Weighted combination (fused multiply-add pattern)
+        consistency_loss = (
+            self.consistency_pt_weight * loss_pt +
+            self.consistency_eta_weight * loss_eta +
+            self.consistency_mass_weight * loss_mass
+        )
+        
+        # Final NaN/Inf check
+        consistency_loss = torch.where(
+            torch.isnan(consistency_loss) | torch.isinf(consistency_loss),
+            torch.zeros_like(consistency_loss),
+            consistency_loss
+        )
+        
+        return consistency_loss
     
     def _kl_divergence(self, mu, logvar):
         """

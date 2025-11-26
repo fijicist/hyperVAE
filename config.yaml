@@ -154,6 +154,7 @@ training:
     edge_features: 2500.0        # Auxiliary loss 
     hyperedge_features: 1500.0   # Auxiliary loss
     jet_features: 6000.0         # REDUCE 8000→6000: N_constituents was inflating this
+    local_global_consistency: 3000.0  # Physics consistency: particles → jet observables
     kl_divergence: 0.3           # Gentle regularization
   
   # Loss function configuration
@@ -196,6 +197,14 @@ training:
     jet_eta_weight: 0.75         # Weight for MSE(jet_eta)
     jet_mass_weight: 2.0        # Weight for MSE(jet_mass)
     jet_n_constituents_weight: 0.0  # DISABLE: MSE on integer counts has wrong scale (400 >> 1)
+    
+    # Local→Global Physics Consistency Loss Configuration
+    # Enforces agreement between generated particle 4-momenta and true jet-level features
+    # Computes jet observables (pT, η, m) from particles and compares to true jet values
+    use_consistency_loss: true  # Enable local→global consistency loss
+    consistency_pt_weight: 2.0  # Weight for pT residual (most important, affects trigger/selection)
+    consistency_eta_weight: 1.0  # Weight for η residual (detector geometry, less critical)
+    consistency_mass_weight: 2.5  # Weight for mass residual (physics discriminant, e.g., top/W/Z tagging)
   
   # KL annealing - Cyclical schedule to prevent posterior collapse and KL explosion
   kl_annealing_schedule: 'cyclical'  # Options: 'linear', 'cyclical'
