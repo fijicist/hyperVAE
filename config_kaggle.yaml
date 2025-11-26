@@ -1,0 +1,240 @@
+model:
+  # Hidden dimensions - INCREASED for better jet-level learning
+  particle_hidden: 128        # Keep at 128 - particle loss is good
+  edge_hidden: 96             # Keep at 96 - edges are auxiliary
+  hyperedge_hidden: 64        # Keep at 64 - hyperedges are simple
+  jet_hidden: 128             # INCREASE 96→128: Jet loss is high, needs more capacity
+  latent_dim: 64              # Keep at 64 - sufficient capacity
+  attention_heads: 4          # Keep at 4 - stable
+  max_particles: 60
+
+  # Physical constraints for generated particle features
+  # rapidity (y) will be constrained to [-particle_y_range, particle_y_range]
+  # phi will be constrained to [-particle_phi_range, particle_phi_range]
+  particle_y_range: 4.0
+  particle_phi_range: 3.141592653589793
+  
+  # Feature dimensions - CONFIGURABLE for experimentation
+  particle_features: 4        # Number of particle features: [E, px, py, pz] (4-vector for L-GATr)
+  edge_features: 5            # Number of edge features (e.g., ln_delta, ln_kt, ln_z, ln_m2)
+  hyperedge_features: 1       # Number of hyperedge features (e.g., 3pt_eec or 4pt_eec)
+  jet_features: 3             # Number of jet-level features (e.g., jet_pt, jet_eta, jet_mass)
+  
+  # Auxiliary training settings - CRITICAL FOR STABILITY
+  use_auxiliary_losses: true      # Use edge/hyperedge as auxiliary losses
+  auxiliary_loss_weight: 0.1      # Weight auxiliary losses 10x less than particle loss
+  
+  # Architecture - Symmetric encoder/decoder 
+  encoder:
+    # Particle encoding (L-GATr layers with Lorentz equivariance)
+    particle_layers: 3        # Number of L-GATr blocks (num_blocks parameter)
+    
+    # ==========================================
+    # L-GATr Configuration for Encoder
+    # ==========================================
+    # Based on official L-GATr library: https://heidelberg-hepml.github.io/lgatr/
+    lgatr:
+      # === CORE L-GATR PARAMETERS ===
+      # Geometric Algebra (GA) Multivector Channels
+      in_mv_channels: 1         # Input: 1 channel of 4-vectors (E, px, py, pz)
+      out_mv_channels: 0        # Output: no multivector (project to scalars for latent)
+      hidden_mv_channels: 32     # Hidden GA multivector channels
+      
+      # Scalar Channels (non-geometric features)
+      in_s_channels: 0          # No additional scalar inputs (all info in 4-momentum)
+      out_s_channels: 64        # Output: scalar embedding for latent projection
+      hidden_s_channels: 64     # Hidden scalar channels
+      
+      # === TRANSFORMER ARCHITECTURE ===
+      num_blocks: 4             # Number of L-GATr transformer blocks (overrides particle_layers if set)
+      
+      # Attention Configuration
+      attention:
+        num_heads: 4            # Multi-head attention (4 heads standard)
+        multi_query: true       # Memory-efficient attention (critical for 4GB VRAM)
+        dropout_prob: 0.25           # Attention dropout
+        # use_flash_attention: false  # Flash attention (requires flash-attn package)
+        head_scale: true     # Enable head scaling for stability
+        
+      # MLP Configuration (between attention layers)
+      mlp:
+        activation: "gelu"      # GELU activation (standard for transformers)
+        num_hidden_layers: 3   # MLP depth in each block
+    
+    # Edge encoding (MLP layers with residual connections)
+    edge_layers: 5            # Number of MLP layers for edges
+    
+    # Hyperedge encoding (MLP layers with residual connections)
+    hyperedge_layers: 3       # Number of MLP layers for hyperedges
+    
+    # Jet-level feature encoding (MLP layers with residual connections)
+    jet_layers: 4             # Number of MLP layers for jet features
+    
+    # Regularization
+    dropout: 0.25             # Dropout rate for all encoder layers (non-LGATr)
+    use_residual: true        # Enable residual connections (applies to all layers)
+  
+  decoder:
+    # Particle decoding (L-GATr layers with Lorentz equivariance)
+    particle_layers: 3        # Number of L-GATr blocks (matches encoder)
+    
+    # ==========================================
+    # L-GATr Configuration for Decoder
+    # ==========================================
+    lgatr:
+      # === CORE L-GATR PARAMETERS ===
+      # Geometric Algebra (GA) Multivector Channels
+      in_mv_channels: 1         # Input: 1 channel of 4-vectors (seed for generation)
+      out_mv_channels: 1        # Output: 1 channel of 4-vectors (E, px, py, pz)
+      hidden_mv_channels: 32     # Hidden GA multivector channels (match encoder)
+      
+      # Scalar Channels (non-geometric features)
+      in_s_channels: 64         # Input: scalar features from latent
+      out_s_channels: 0         # Output: no additional scalars (only 4-vectors)
+      hidden_s_channels: 64     # Hidden scalar channels (match encoder)
+      
+      # === TRANSFORMER ARCHITECTURE ===
+      num_blocks: 4             # Number of L-GATr transformer blocks (match encoder)
+      
+      # Attention Configuration
+      attention:
+        num_heads: 4            # Multi-head attention (match encoder)
+        multi_query: true       # Memory-efficient attention
+        dropout_prob: 0.25            # Attention dropout (match encoder)
+        # use_flash_attention: false  # Flash attention
+        head_scale: true     # Enable head scaling for stability
+        
+      # MLP Configuration (between attention layers)
+      mlp:
+        activation: "gelu"      # GELU activation (standard for transformers)
+        num_hidden_layers: 3   # MLP depth in each block
+    
+    # Edge decoding (MLP layers with residual connections)
+    edge_layers: 5            # Number of MLP layers for edges (matches encoder)
+    
+    # Hyperedge decoding (MLP layers with residual connections)
+    hyperedge_layers: 3       # Number of MLP layers for hyperedges (matches encoder)
+    
+    # Jet-level feature decoding (MLP layers with residual connections)
+    jet_layers: 4             # Number of MLP layers for jet features (matches encoder)
+    
+    # Regularization - Increased to combat overfitting
+    dropout: 0.3              # Dropout rate for all decoder layers (0.25→0.3)
+    feature_proj_dropout: 0.3 # Dropout for feature projection layers (0.25→0.3)
+    use_residual: true        # Enable residual connections (applies to all layers)
+    
+    # Topology decoder settings
+    use_gumbel_softmax: true
+    gumbel_temperature: 1.0
+
+training:
+  batch_size: 256                  # Effective batch = 64 * 4 = 256
+  gradient_accumulation_steps: 4  # Good for memory constraints
+  epochs: 200
+  learning_rate: 0.0001           # REDUCE 0.00025→0.0002: Finer updates for stability
+  weight_decay: 0.001             # Keep: L2 regularization
+  latent_noise: 0.01              # Keep: noise for regularization
+  mixed_precision: true           # Enable mixed precision training (FP16/BF16)
+  precision_type: "fp16"          # Precision type: "fp16" (Volta+/Turing+) or "bf16" (Ampere+, better stability)
+  
+  # Gradient clipping (increased for squared distance metric)
+  # Squared distance has linear gradients (∂d²/∂x = 2x) which are more stable than
+  # Euclidean gradients (∂√d²/∂x = x/d) that can spike for small errors
+  # Increased from 0.75 to allow stronger but stable gradients
+  gradient_clip: 3.0
+  
+  # Scheduler
+  scheduler: "cosine"
+  warmup_epochs: 10
+  min_lr: 0.00001
+  
+  # REBALANCED LOSS WEIGHTS - N_constituents removed from jet loss
+  loss_weights:
+    particle_features: 12000.0    # Particle Chamfer distance
+    edge_features: 4000.0        # Auxiliary loss 
+    hyperedge_features: 2500.0   # Auxiliary loss
+    jet_features: 6000.0         # REDUCE 8000→6000: N_constituents was inflating this
+    local_global_consistency: 3000.0  # Physics consistency: particles → jet observables
+    kl_divergence: 0.3           # Gentle regularization
+  
+  # Loss function configuration
+  loss_config:
+    particle_loss_type: "hyperbolic_chamfer"  # Options: "chamfer", "hyperbolic_chamfer", "mse"
+    particle_distance_metric: "euclidean_4d"  # Standard 4D Euclidean distance for [E, px, py, pz]
+    
+    # Particle feature indices [E, px, py, pz]
+    E_index: 0                  # Index of energy E in particle features
+    px_index: 1                 # Index of px momentum component
+    py_index: 2                 # Index of py momentum component
+    pz_index: 3                 # Index of pz momentum component
+    
+    # Squared distance vs Euclidean distance for usual Chamfer distance
+    # Squared (d²): Strong gradients (∇d² = 2x), consistent training/val, faster computation
+    # Euclidean (√d²): Standard metric but vanishing gradients for large errors (∇√d² = 1/(2√x))
+    # Recommendation: Use squared for normalized features to avoid gradient plateau
+    use_squared_distance: true   # Use squared distance for all epochs (training + validation)
+    
+    # Hyperbolic Chamfer distance configuration
+    # Uses hyperbolic geometry transformation: d_hyp = arcosh(1 + α × d_E²)
+    # Paper: arXiv:2412.17951 shows hyperbolic Chamfer better captures jet structure
+    hyperbolic_alpha: 1.5        # Hyperparameter controlling hyperbolic curvature
+                                 # α → 0: recovers standard Chamfer
+                                 # α > 0: stronger hyperbolic effect, emphasizes large distances
+    
+    # pT-weighted Chamfer loss
+    use_pt_weighting: true      # Enable pT-based weighting of Chamfer or Hyperbolic chamfer distance
+    pt_weight_alpha: 1.0        # Exponent for pT weighting: α=1.0 (linear), α=2.0 (quadratic)
+    
+    evaluation_metric: "hyperbolic_chamfer"  # Use chamfer or hyperbolic chamfer for validation too (was "wasserstein" with wrong scale)
+    
+    # Jet-level feature indices in y tensor [jet_type, jet_pt, jet_eta, jet_mass, ...]
+    jet_pt_index: 1             # Index of jet_pt in y tensor
+    jet_eta_index: 2            # Index of jet_eta in y tensor
+    jet_mass_index: 3           # Index of jet_mass in y tensor
+    
+    # Jet features loss weights (individual MSE components)
+    jet_pt_weight: 2.5          # Weight for MSE(jet_pt)
+    jet_eta_weight: 1.0         # Weight for MSE(jet_eta)
+    jet_mass_weight: 2.0        # Weight for MSE(jet_mass)
+    jet_n_constituents_weight: 0.0  # DISABLE: MSE on integer counts has wrong scale (400 >> 1)
+
+    # Local→Global Physics Consistency Loss Configuration
+    # Enforces agreement between generated particle 4-momenta and true jet-level features
+    # Computes jet observables (pT, η, m) from particles and compares to true jet values
+    use_consistency_loss: true  # Enable local→global consistency loss
+    consistency_pt_weight: 2.0  # Weight for pT residual (most important, affects trigger/selection)
+    consistency_eta_weight: 1.0  # Weight for η residual (detector geometry, less critical)
+    consistency_mass_weight: 2.5  # Weight for mass residual (physics discriminant, e.g., top/W/Z tagging)
+  
+  # KL annealing - Cyclical schedule 
+  kl_annealing_schedule: 'cyclical'  # Options: 'linear', 'cyclical'
+  kl_warmup_epochs: 8           # Warmup: 12 epochs (0.00 → max_weight)
+  kl_cycle_epochs: 25            # Cycle: 30 epochs total (12 warmup + 18 plateau)
+                                 # Reset every 30 epochs to prevent explosion
+  kl_free_bits: 2.0              # Free bits
+                                 # Allows KL to grow naturally but not collapse to 0
+  kl_max_weight: 0.12            # TUNED: Max multiplier for kl_divergence weight
+                                 # Effective max KL weight = 0.3 * 0.25 = 0.075
+
+  # Temperature annealing for Gumbel-Softmax
+  initial_temperature: 5.0
+  final_temperature: 0.5
+  temperature_decay: 0.98
+  
+  # Checkpointing
+  save_every: 10
+  validate_every: 5
+  
+  # Early stopping
+  patience: 50
+  min_delta: 0.001
+
+# Data
+data:
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
