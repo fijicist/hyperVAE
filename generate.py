@@ -129,7 +129,7 @@ from torch_geometric.data import Data
 from models.hypervae import BipartiteHyperVAE
 
 
-def generate_jets(model, num_samples, batch_size, jet_type_dist, device):
+def generate_jets(model, num_samples, batch_size, jet_type_dist, device, temperature=0.5):
     """
     Generate jets using trained VAE model by sampling from latent prior.
     
@@ -143,6 +143,8 @@ def generate_jets(model, num_samples, batch_size, jet_type_dist, device):
         jet_type_dist: [3] array with jet type probabilities [p_quark, p_gluon, p_top]
                        Must sum to 1.0
         device: torch.device for generation ('cuda' or 'cpu')
+        temperature: Gumbel-Softmax temperature for topology sampling (default: 0.5)
+                     Lower = more deterministic, Higher = more stochastic
     
     Returns:
         dict with keys:
@@ -178,7 +180,7 @@ def generate_jets(model, num_samples, batch_size, jet_type_dist, device):
             output = model.decoder(
                 z, 
                 jet_type_tensor, 
-                temperature=0.5,
+                temperature=temperature,
                 generate_edges=False,        # ✅ Don't generate edges
                 generate_hyperedges=False    # ✅ Don't generate hyperedges
             )
@@ -349,6 +351,14 @@ def main(args):
         print(f"\nJet type distribution: Quark={jet_type_dist[0]:.2f}, "
               f"Gluon={jet_type_dist[1]:.2f}, Top={jet_type_dist[2]:.2f}")
     
+    # Determine generation temperature
+    if args.temperature is not None:
+        temperature = args.temperature
+        print(f"\nUsing temperature: {temperature:.2f} (from command line)")
+    else:
+        temperature = config['training'].get('final_temperature', 0.5)
+        print(f"\nUsing temperature: {temperature:.2f} (from config final_temperature)")
+    
     # Generate jets
     print(f"\nGenerating {args.num_samples} jets...")
     generated_data = generate_jets(
@@ -356,7 +366,8 @@ def main(args):
         args.num_samples,
         args.batch_size,  
         jet_type_dist,    
-        device
+        device,
+        temperature=temperature
     )
     
     # Print statistics
@@ -381,6 +392,8 @@ if __name__ == "__main__":
     parser.add_argument('--gluon-frac', type=float, default=0.33, help='Fraction of gluon jets (used if --jet-type not set)')
     parser.add_argument('--top-frac', type=float, default=0.34, help='Fraction of top jets (used if --jet-type not set)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if available')
+    parser.add_argument('--temperature', type=float, default=None, 
+                        help='Gumbel-Softmax temperature (default: uses final_temperature from config)')
     
     args = parser.parse_args()
     main(args)

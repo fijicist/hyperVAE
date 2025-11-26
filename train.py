@@ -189,8 +189,14 @@ def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device)
     for i, batch in enumerate(pbar):
         batch = batch.to(device)
         
-        # Gumbel temperature annealing
-        temperature = max(0.5, 1.0 - epoch / 100)
+        # Gumbel temperature annealing from config
+        initial_temp = config['training'].get('initial_temperature', 5.0)
+        final_temp = config['training'].get('final_temperature', 0.5)
+        temp_decay = config['training'].get('temperature_decay', 0.98)
+        
+        # Exponential decay: temp = final + (initial - final) * decay^epoch
+        temperature = final_temp + (initial_temp - final_temp) * (temp_decay ** epoch)
+        temperature = max(final_temp, temperature)  # Clamp to final temp
         
         # Mixed precision training with configurable dtype
         with torch.cuda.amp.autocast(enabled=use_mixed_precision, dtype=dtype):
@@ -310,13 +316,17 @@ def validate(model, loader, config, epoch, writer, device):
     use_mixed_precision = config['training']['mixed_precision']
     dtype = torch.bfloat16 if precision_type == 'bf16' else torch.float16
     
+    # Use final (converged) temperature for validation
+    # This represents the model's behavior when fully trained
+    val_temperature = config['training'].get('final_temperature', 0.5)
+    
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validation"):
             batch = batch.to(device)
             
             # Use mixed precision for validation too
             with torch.cuda.amp.autocast(enabled=use_mixed_precision, dtype=dtype):
-                output = model(batch, temperature=0.5)
+                output = model(batch, temperature=val_temperature)
                 losses = model.compute_loss(batch, output, epoch=epoch)
             
             total_loss += losses['total'].item() if isinstance(losses['total'], torch.Tensor) else losses['total']

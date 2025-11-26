@@ -125,7 +125,8 @@ model:
     
     # Topology decoder settings
     use_gumbel_softmax: true
-    gumbel_temperature: 1.0
+    # Note: Gumbel temperature is controlled by training.initial_temperature, 
+    # training.final_temperature, and training.temperature_decay settings below
 
 training:
   batch_size: 256                  # Effective batch = 64 * 4 = 256
@@ -216,10 +217,13 @@ training:
   kl_max_weight: 0.12            # TUNED: Max multiplier for kl_divergence weight
                                  # Effective max KL weight = 0.3 * 0.25 = 0.075
 
-  # Temperature annealing for Gumbel-Softmax
-  initial_temperature: 5.0
-  final_temperature: 0.5
-  temperature_decay: 0.98
+  # Gumbel-Softmax Temperature Annealing
+  # Controls the sharpness of discrete topology sampling (particle/edge/hyperedge existence)
+  # Higher temp → softer/more random, Lower temp → sharper/more deterministic
+  # Annealing schedule: temp(epoch) = final_temp + (initial_temp - final_temp) × decay^epoch
+  initial_temperature: 5.0       # Start with very soft sampling (explore topology space)
+  final_temperature: 0.5         # End with sharp sampling (confident discrete choices)
+  temperature_decay: 0.98        # Exponential decay rate (0.98^100 ≈ 0.13, aggressive annealing)
   
   # Checkpointing
   save_every: 10
