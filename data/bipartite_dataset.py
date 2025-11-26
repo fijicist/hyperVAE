@@ -111,7 +111,7 @@ class BipartiteJetDataset(Dataset):
             raise FileNotFoundError(f"Data file not found: {data_path}")
         
         # Load PyG Data list
-        data_list = torch.load(data_path)
+        data_list = torch.load(data_path, weights_only=False)
         
         if not isinstance(data_list, list):
             raise ValueError(f"Expected list of Data objects, got {type(data_list)}")
