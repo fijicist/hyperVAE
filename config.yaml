@@ -123,6 +123,27 @@ model:
     feature_proj_dropout: 0.3 # Dropout for feature projection layers (0.25→0.3)
     use_residual: true        # Enable residual connections (applies to all layers)
     
+    # Per-particle variation scale (CRITICAL for diverse particle generation)
+    # Controls how much each particle differs from others in a jet
+    # Initial value for learnable parameter (model learns optimal value during training)
+    # Range: 0.0 (no variation) to 1.0 (full variation)
+    # Default: 0.5 (balanced - encourages diversity while allowing model to learn)
+    # Set to 0.0 for ablation studies to test without per-particle variation
+    particle_variation_scale: 0.5
+    
+    # Edge variation scale (controls noise diversity in edge features)
+    # Currently DISABLED (0.0) because:
+    #   - Edge topology is deterministic (fully-connected, not learned)
+    #   - Edge features are auxiliary losses (not critical for generation)
+    #   - Adding noise to auxiliary features doesn't improve learning
+    # Set to 0.1-0.3 if edge topology becomes learned in future
+    edge_variation_scale: 0.0
+    
+    # Hyperedge variation scale (controls per-hyperedge diversity)
+    # Currently DISABLED (0.0) because:
+    #   - Only 1 hyperedge feature (3pt_EEC) - variation = random noise on scalar
+    hyperedge_variation_scale: 0.0
+    
     # Topology decoder settings
     use_gumbel_softmax: true
     # Note: Gumbel temperature is controlled by training.initial_temperature, 

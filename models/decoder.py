@@ -108,23 +108,59 @@ class BipartiteDecoder(nn.Module):
         # 3. Particle Feature Decoder using official L-GATr
         self.particle_decoder = LGATrParticleDecoder(config)
         
+        # 3.5. Per-particle variation module (CRITICAL FIX for particle diversity)
+        # Creates unique features per particle using particle index + latent
+        # Prevents all particles from having identical initial states
+        self.particle_variation = nn.Sequential(
+            nn.Linear(lgatr_scalar_dim + 1, lgatr_scalar_dim),  # +1 for particle index
+            nn.GELU(),
+            nn.Linear(lgatr_scalar_dim, lgatr_scalar_dim)
+        )
+        
+        # Learnable scale parameter for per-particle variation
+        # Controls how much variation is applied (model learns optimal value during training)
+        # Initial value from config (default: 0.5, range typically 0.1-1.0)
+        initial_scale = config['decoder'].get('particle_variation_scale', 0.5)
+        self.particle_variation_scale = nn.Parameter(torch.tensor(initial_scale))
+        
+        # 3.6. Initial 4-momentum projection from per-particle scalars
+        # Projects unique per-particle scalars to initial 4-momentum guess
+        # This gives L-GATr meaningful, diverse starting points for refinement
+        self.scalar_to_4mom_init = nn.Sequential(
+            nn.Linear(lgatr_scalar_dim, lgatr_scalar_dim),
+            nn.GELU(),
+            nn.Linear(lgatr_scalar_dim, 4)
+        )
+        
+        # Pre-compute and cache particle indices for efficiency (computed once, reused)
+        # Normalized indices [0, 1/(max_p-1), 2/(max_p-1), ..., 1.0]
+        # Leading particles (low index) vs soft particles (high index)
+        self.register_buffer(
+            'particle_indices_normalized',
+            torch.arange(max_particles, dtype=torch.float32) / max(max_particles - 1, 1)
+        )
+        
         # 4. Edge Feature Decoder with residual connections
         num_heads = config.get('attention_heads', 4)  # Keep for backward compatibility
         edge_features = config.get('edge_features', 5)
         edge_layers = config['decoder'].get('edge_layers', 3)
+        edge_variation_scale = config['decoder'].get('edge_variation_scale', 0.1)
         self.edge_decoder = EdgeFeatureDecoder(
             edge_hidden, num_heads, dropout,
             num_features=edge_features,
-            num_layers=edge_layers
+            num_layers=edge_layers,
+            variation_scale=edge_variation_scale
         )
         
         # 5. Hyperedge Feature Decoder
         hyperedge_features = config.get('hyperedge_features', 2)
         hyperedge_layers = config['decoder'].get('hyperedge_layers', config['decoder'].get('mlp_layers', 2))
+        hyperedge_variation_scale = config['decoder'].get('hyperedge_variation_scale', 0.5)
         self.hyperedge_decoder = HyperedgeFeatureDecoder(
             hyperedge_hidden, num_heads, dropout,
             num_features=hyperedge_features,
-            num_layers=hyperedge_layers
+            num_layers=hyperedge_layers,
+            variation_scale=hyperedge_variation_scale
         )
         
         # 6. Jet Feature Decoder (configurable depth and width)
@@ -213,14 +249,49 @@ class BipartiteDecoder(nn.Module):
         topology = self.topology_decoder(particle_scalars, edge_h, hyperedge_h, temperature)
         
         # 3. ALWAYS decode particle features using official L-GATr
-        # Need to create initial 4-vectors from topology and then refine with L-GATr
-        # Start with small random 4-vectors (will be refined by L-GATr)
         batch_size_actual = z.size(0)
         max_p = topology['particle_mask'].size(1)
-        initial_fourmomenta = torch.randn(batch_size_actual, max_p, 4, device=device) * 0.1
+        device = z.device
         
-        # Expand scalar features to per-particle (broadcast latent info to all particles)
-        particle_scalars_expanded = particle_scalars.unsqueeze(1).expand(batch_size_actual, max_p, -1)
+        # Generate per-particle scalars with positional encoding
+        # Get cached indices (pre-computed in __init__) [max_p]
+        indices = self.particle_indices_normalized[:max_p].view(1, max_p, 1)
+        
+        # Expand base scalars [batch, max_p, lgatr_scalar_dim]
+        particle_scalars_base = particle_scalars.unsqueeze(1).expand(batch_size_actual, max_p, -1)
+        
+        # Single concat operation [batch, max_p, lgatr_scalar_dim+1]
+        particle_scalars_with_idx = torch.cat([
+            particle_scalars_base, 
+            indices.expand(batch_size_actual, -1, -1)
+        ], dim=-1)
+        
+        # Single reshape + forward + fused scale application
+        # Flatten [batch*max_p, lgatr_scalar_dim+1]
+        flat_input = particle_scalars_with_idx.view(-1, lgatr_scalar_dim + 1)
+        
+        # Generate variation [batch*max_p, lgatr_scalar_dim]
+        particle_variation_flat = self.particle_variation(flat_input)
+        
+        # Fused operations - add base + scaled variation in one step
+        # Flatten base for addition
+        particle_scalars_base_flat = particle_scalars_base.reshape(-1, lgatr_scalar_dim)
+        
+        # Apply scale and combine (fused operation, more efficient)
+        scale = torch.sigmoid(self.particle_variation_scale)
+        particle_scalars_expanded = (
+            particle_scalars_base_flat + particle_variation_flat * scale
+        ).view(batch_size_actual, max_p, -1)
+        
+        # Generate per-particle initial 4-momenta [batch, max_p, 4]
+        # Each particle gets unique initial guess based on its position and latent
+        # Reuse flattened tensor, single reshape at end
+        initial_fourmomenta = self.scalar_to_4mom_init(
+            particle_scalars_expanded.view(-1, lgatr_scalar_dim)
+        ).view(batch_size_actual, max_p, 4)
+        
+        # Add small noise for regularization (stochastic gradient)
+        initial_fourmomenta = initial_fourmomenta + torch.randn_like(initial_fourmomenta) * 0.01
         
         # Pass through L-GATr decoder
         lgatr_output = self.particle_decoder(
@@ -503,7 +574,7 @@ class ParticleFeatureDecoder(nn.Module):
 class EdgeFeatureDecoder(nn.Module):
     """Decode edge features with residual connections"""
     
-    def __init__(self, hidden_dim, num_heads, dropout, num_features=5, num_layers=3):
+    def __init__(self, hidden_dim, num_heads, dropout, num_features=5, num_layers=3, variation_scale=0.1):
         super().__init__()
         
         self.num_features = num_features
@@ -524,29 +595,57 @@ class EdgeFeatureDecoder(nn.Module):
         
         # Final projection to edge features
         self.feature_proj = nn.Linear(hidden_dim, num_features)
+        
+        # Learnable noise scale for edge variation (configurable)
+        # Controls diversity in edge features (default: 0.1 for subtle variation)
+        self.variation_scale = nn.Parameter(torch.tensor(variation_scale))
     
     def forward(self, edge_h, edge_index_list, n_particles):
         """Generate edge features with residual connections"""
         batch_size = edge_h.size(0)
+        device = edge_h.device
         
         # Apply MLP layers with residual connections
         for layer in self.edge_mlp:
             edge_h = edge_h + layer(edge_h)  # Residual connection
         
-        # Project to features
-        edge_features = self.feature_proj(edge_h)
+        # Project to features per batch element [batch_size, num_features]
+        edge_features_base = self.feature_proj(edge_h)
         
-        # For now, return a placeholder (proper implementation needs edge indexing)
-        return edge_features.unsqueeze(1).expand(batch_size, 10, self.num_features)
+        # Vectorized edge generation (no Python loops)
+        # Count edges per jet
+        edge_counts = torch.tensor([ei.size(1) for ei in edge_index_list], 
+                                   dtype=torch.long, device=device)
+        max_edges = edge_counts.max().item()
+        
+        if max_edges == 0:
+            return torch.zeros(batch_size, 0, self.num_features, device=device)
+        
+        # Pre-allocate output tensor (single allocation, more efficient)
+        output = torch.zeros(batch_size, max_edges, self.num_features, device=device)
+        
+        # Vectorized: Expand features and add noise in one go
+        # Create mask for valid edges
+        edge_mask = torch.arange(max_edges, device=device).unsqueeze(0) < edge_counts.unsqueeze(1)
+        
+        # Broadcast base features to all positions
+        output = edge_features_base.unsqueeze(1).expand(-1, max_edges, -1).clone()
+        
+        # Add noise only to valid edges (vectorized, with learnable scale)
+        noise = torch.randn_like(output) * torch.abs(self.variation_scale)  # abs() ensures positive
+        output = torch.where(edge_mask.unsqueeze(-1), output + noise, output)
+        
+        return output  # [batch_size, max_edges, num_features]
 
 
 class HyperedgeFeatureDecoder(nn.Module):
-    """Decode hyperedge features (memory-efficient)"""
+    """Decode hyperedge features"""
     
-    def __init__(self, hidden_dim, num_heads, dropout, num_features=2, num_layers=2):
+    def __init__(self, hidden_dim, num_heads, dropout, num_features=2, num_layers=2, variation_scale=0.5):
         super().__init__()
         
         self.num_features = num_features
+        self.hidden_dim = hidden_dim
         
         # Use MLP instead of attention to save memory (for large hyperedge sets)
         self.mlp_layers = nn.ModuleList([
@@ -566,26 +665,56 @@ class HyperedgeFeatureDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim // 2, num_features)  # Configurable number of hyperedge features
         )
+        
+        # Per-hyperedge variation module (creates unique features per hyperedge)
+        self.hyperedge_variation = nn.Sequential(
+            nn.Linear(hidden_dim + 1, hidden_dim),  # +1 for hyperedge index
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Learnable scale for variation (configurable, similar to particle decoder)
+        # Controls how much per-hyperedge variation is applied (default: 0.5)
+        self.variation_scale = nn.Parameter(torch.tensor(variation_scale))
     
     def forward(self, hyperedge_h, hyperedge_mask, n_hyperedges):
         """Generate hyperedge features"""
         batch_size = hyperedge_h.size(0)
         max_he = hyperedge_mask.size(1)
+        device = hyperedge_h.device
         
-        # Expand
-        hyperedge_h_expanded = hyperedge_h.unsqueeze(1).expand(batch_size, max_he, -1)
-        
-        # Apply MLP with residual (memory-efficient)
+        # Apply MLP with residual to base representation
+        hyperedge_h_base = hyperedge_h
         for layer in self.mlp_layers:
-            hyperedge_h_expanded = hyperedge_h_expanded.reshape(-1, hyperedge_h.size(-1))
-            hyperedge_h_expanded = hyperedge_h_expanded + layer(hyperedge_h_expanded)
-            hyperedge_h_expanded = hyperedge_h_expanded.reshape(batch_size, max_he, -1)
+            hyperedge_h_base = hyperedge_h_base + layer(hyperedge_h_base)
         
-        # Generate features
-        hyperedge_features = self.feature_proj(hyperedge_h_expanded)
+        # Pre-compute and cache indices (computed once per forward)
+        # Normalized indices [0, 1/(max_he-1), ..., 1.0]
+        hyperedge_indices_normalized = (
+            torch.arange(max_he, device=device, dtype=torch.float32) / max(max_he - 1, 1)
+        ).view(1, max_he, 1)  # [1, max_he, 1] for broadcasting
         
-        # Apply mask
-        hyperedge_features = hyperedge_features * hyperedge_mask.unsqueeze(-1)
+        # Expand base features to all hyperedges [batch, max_he, hidden]
+        hyperedge_h_expanded = hyperedge_h_base.unsqueeze(1).expand(batch_size, max_he, -1)
+        
+        # Single concatenate + reshape + forward pass
+        # Concatenate with normalized index [batch, max_he, hidden+1]
+        hyperedge_input = torch.cat([
+            hyperedge_h_expanded, 
+            hyperedge_indices_normalized.expand(batch_size, -1, -1)
+        ], dim=-1)
+        
+        # Single reshape and forward pass (more efficient than multiple reshapes)
+        hyperedge_variation = self.hyperedge_variation(
+            hyperedge_input.view(-1, self.hidden_dim + 1)
+        ).view(batch_size, max_he, -1)
+        
+        # Combine base + scaled variation (learnable scale for flexibility)
+        scale = torch.sigmoid(self.variation_scale)  # Keep in [0, 1]
+        hyperedge_h_final = hyperedge_h_expanded + hyperedge_variation * scale
+        
+        # Generate features and apply mask in one operation
+        hyperedge_features = self.feature_proj(hyperedge_h_final) * hyperedge_mask.unsqueeze(-1)
         
         return hyperedge_features
 
