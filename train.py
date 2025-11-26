@@ -172,6 +172,7 @@ def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device)
         'hyperedge': 0.0,
         'jet': 0.0,
         'kl': 0.0,
+        'consistency': 0.0,
         'kl_weight': 0.0
     }
     
@@ -300,7 +301,8 @@ def validate(model, loader, config, epoch, writer, device):
         'edge': 0.0,
         'hyperedge': 0.0,
         'jet': 0.0,
-        'kl': 0.0
+        'kl': 0.0,
+        'consistency': 0.0
     }
     
     # Determine precision dtype
@@ -523,6 +525,7 @@ def main(args):
                   f"Edge: {losses_dict['edge']:.4f}, "
                   f"Hyper: {losses_dict['hyperedge']:.4f}, "
                   f"Jet: {losses_dict['jet']:.4f}, "
+                  f"Cons: {losses_dict['consistency']:.4f}, "
                   f"KL: {losses_dict['kl']:.4f} (w={losses_dict['kl_weight']:.4f})")
             
             # Print validation losses
@@ -530,6 +533,7 @@ def main(args):
                   f"Edge: {val_losses_dict['edge']:.4f}, "
                   f"Hyper: {val_losses_dict['hyperedge']:.4f}, "
                   f"Jet: {val_losses_dict['jet']:.4f}, "
+                  f"Cons: {val_losses_dict['consistency']:.4f}, "
                   f"KL: {val_losses_dict['kl']:.4f}")
             
             # Save best model
