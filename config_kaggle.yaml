@@ -8,21 +8,11 @@ model:
   attention_heads: 4          # Keep at 4 - stable
   max_particles: 60
 
-  # Physical constraints for generated particle features
-  # rapidity (y) will be constrained to [-particle_y_range, particle_y_range]
-  # phi will be constrained to [-particle_phi_range, particle_phi_range]
-  particle_y_range: 4.0
-  particle_phi_range: 3.141592653589793
-  
-  # Feature dimensions - CONFIGURABLE for experimentation
-  particle_features: 4        # Number of particle features: [E, px, py, pz] (4-vector for L-GATr)
-  edge_features: 5            # Number of edge features (e.g., ln_delta, ln_kt, ln_z, ln_m2)
-  hyperedge_features: 1       # Number of hyperedge features (e.g., 3pt_eec or 4pt_eec)
-  jet_features: 3             # Number of jet-level features (e.g., jet_pt, jet_eta, jet_mass)
-  
-  # Auxiliary training settings - CRITICAL FOR STABILITY
-  use_auxiliary_losses: true      # Use edge/hyperedge as auxiliary losses
-  auxiliary_loss_weight: 0.1      # Weight auxiliary losses 10x less than particle loss
+  # Feature dimensions
+  particle_features: 4        # [E, px, py, pz] (4-vector for L-GATr)
+  edge_features: 5            # [2pt_EEC, ln_delta, ln_kT, ln_z, ln_m2]
+  hyperedge_features: 1       # [3pt_EEC, and so on]
+  jet_features: 3             # [jet_pt, jet_eta, jet_mass]
   
   # Architecture - Symmetric encoder/decoder 
   encoder:
@@ -109,19 +99,9 @@ model:
         activation: "gelu"      # GELU activation (standard for transformers)
         num_hidden_layers: 3   # MLP depth in each block
     
-    # Edge decoding (MLP layers with residual connections)
-    edge_layers: 5            # Number of MLP layers for edges (matches encoder)
-    
-    # Hyperedge decoding (MLP layers with residual connections)
-    hyperedge_layers: 3       # Number of MLP layers for hyperedges (matches encoder)
-    
-    # Jet-level feature decoding (MLP layers with residual connections)
-    jet_layers: 4             # Number of MLP layers for jet features (matches encoder)
-    
-    # Regularization - Increased to combat overfitting
-    dropout: 0.3              # Dropout rate for all decoder layers (0.25→0.3)
-    feature_proj_dropout: 0.3 # Dropout for feature projection layers (0.25→0.3)
-    use_residual: true        # Enable residual connections (applies to all layers)
+    # Regularization
+    dropout: 0.3              # Dropout rate for all decoder layers
+    feature_proj_dropout: 0.3 # Dropout for feature projection layers
 
     # Per-particle variation scale (CRITICAL for diverse particle generation)
     # Controls how much each particle differs from others in a jet
@@ -130,19 +110,6 @@ model:
     # Default: 0.5 (balanced - encourages diversity while allowing model to learn)
     # Set to 0.0 for ablation studies to test without per-particle variation
     particle_variation_scale: 0.5
-    
-    # Edge variation scale (controls noise diversity in edge features)
-    # Currently DISABLED (0.0) because:
-    #   - Edge topology is deterministic (fully-connected, not learned)
-    #   - Edge features are auxiliary losses (not critical for generation)
-    #   - Adding noise to auxiliary features doesn't improve learning
-    # Set to 0.1-0.3 if edge topology becomes learned in future
-    edge_variation_scale: 0.0
-    
-    # Hyperedge variation scale (controls per-hyperedge diversity)
-    # Currently DISABLED (0.0) because:
-    #   - Only 1 hyperedge feature (3pt_EEC) - variation = random noise on scalar
-    hyperedge_variation_scale: 0.0
     
     # Topology decoder settings
     use_gumbel_softmax: true
@@ -163,21 +130,21 @@ training:
   # Squared distance has linear gradients (∂d²/∂x = 2x) which are more stable than
   # Euclidean gradients (∂√d²/∂x = x/d) that can spike for small errors
   # Increased from 0.75 to allow stronger but stable gradients
-  gradient_clip: 3.0
+  gradient_clip: 10.0
   
   # Scheduler
   scheduler: "cosine"
   warmup_epochs: 10
   min_lr: 0.00001
   
-  # REBALANCED LOSS WEIGHTS - N_constituents removed from jet loss
+  # Loss weights for different components
   loss_weights:
-    particle_features: 12000.0    # Particle Chamfer distance
-    edge_features: 4000.0        # Auxiliary loss 
-    hyperedge_features: 2500.0   # Auxiliary loss
-    jet_features: 6000.0         # REDUCE 8000→6000: N_constituents was inflating this
-    local_global_consistency: 3000.0  # Physics consistency: particles → jet observables
-    kl_divergence: 0.3           # Gentle regularization
+    particle_features: 12000.0       # Particle Chamfer distance
+    jet_features: 3000.0             # Jet-level feature loss (jet_pt, jet_eta, jet_mass)
+    edge_distribution: 1.0           # Edge distribution matching (2-pt EEC + observables)
+    hyperedge_distribution: 1.0      # Hyperedge distribution matching (3-pt+ EEC)
+    local_global_consistency: 3000.0 # Physics consistency: particles → jet observables
+    kl_divergence: 0.3               # Gentle regularization
   
   # Loss function configuration
   loss_config:
@@ -227,6 +194,10 @@ training:
     consistency_pt_weight: 2.0  # Weight for pT residual (most important, affects trigger/selection)
     consistency_eta_weight: 1.0  # Weight for η residual (detector geometry, less critical)
     consistency_mass_weight: 2.5  # Weight for mass residual (physics discriminant, e.g., top/W/Z tagging)
+    
+    # Distribution Loss: Wasserstein distance between edge/hyperedge observables
+    use_distribution_loss: true      # Enable distribution matching loss
+    eec_prop: [[2, 3], 200, [1e-4, 2]]  # [[N-point orders], bins, [axis_min, axis_max]]
   
   # KL annealing - Cyclical schedule 
   kl_annealing_schedule: 'cyclical'  # Options: 'linear', 'cyclical'

@@ -1,27 +1,32 @@
 """
-Bipartite Hypergraph Variational Autoencoder (HyperVAE) for Jet Generation
+Particle Jet Variational Autoencoder (HyperVAE) for Jet Generation
 
-This module implements a memory-optimized VAE architecture that combines:
-1. Lorentz-equivariant attention (L-GATr) for physics-preserving particle encoding
-2. Bipartite graph structure for particle-level and edge/hyperedge features
-3. Squared distance Chamfer loss for stable gradient flow
+This module implements a physics-informed VAE architecture that combines:
+1. Lorentz-equivariant attention (L-GATr) for particle 4-momenta processing
+2. Graph structure learning via edge/hyperedge observables from dataset
+3. Distribution matching losses for multi-particle correlations
+4. Local→global consistency for physics-preserving generation
 
 Key Features:
-- L-GATr integration for 4-vector (E, px, py, pz) processing
-- Squared distance metric to prevent gradient vanishing
-- Multi-task learning with particle, edge, hyperedge, and jet-level losses
-- KL divergence annealing for stable VAE training
-- Auxiliary loss weighting for edge/hyperedge features
+- L-GATr integration for 4-vector (E, px, py, pz) processing with Lorentz symmetry
+- Hyperbolic Chamfer loss for robust set matching
+- Distribution losses: Wasserstein distance on edge/hyperedge observables
+- Local→global consistency: Enforces particles sum to correct jet observables
+- KL divergence annealing with cyclical schedule for stable training
 
 Architecture:
-- Encoder: BipartiteEncoder with L-GATr particle processing
-- Decoder: BipartiteDecoder with L-GATr-based particle generation
-- Loss: Weighted combination of reconstruction + KL divergence
+- Encoder: Processes particles + graph structure → latent distribution q(z|x)
+- Decoder: Generates particles + jet features from latent code z
+- Loss: Particle Chamfer + Distribution matching + Jet features + Consistency + KL
 
-Memory Optimization:
-- Gradient accumulation for effective large batch sizes
-- Mixed precision (FP16) training support
-- Efficient PyG batch format handling
+Loss Components:
+1. Particle: Hyperbolic Chamfer distance (pT-weighted set matching)
+2. Distribution: Wasserstein on edge (2-pt EEC) and hyperedge (N-pt EEC) observables
+3. Jet: MSE on jet_pt, jet_eta, jet_mass predictions
+4. Consistency: Particles 4-momenta sum to jet-level observables
+5. KL: Latent regularization with cyclical annealing
+
+Note: Edge/hyperedge features computed FROM particles during loss, not decoder outputs
 """
 
 import torch
@@ -31,39 +36,42 @@ from .encoder import BipartiteEncoder
 from .decoder import BipartiteDecoder
 from scipy.stats import wasserstein_distance
 import numpy as np
+import math
+import sys
+# Add parent directory to path to import utils
+sys.path.insert(0, '/home/anuranja/sanmay_project/work/hyperVAE')
+from utils import get_eec_ls_values
 
 
 class BipartiteHyperVAE(nn.Module):
     """
-    Bipartite Hypergraph Variational Autoencoder for Jet Generation.
+    Particle Jet Variational Autoencoder for Physics-Informed Generation.
     
-    This model encodes particle jets as bipartite hypergraphs and learns a latent
-    representation using variational inference. The decoder reconstructs particle
-    4-vectors, edges (pairwise features), and hyperedges (higher-order correlations).
+    Encodes jets into latent space and reconstructs particles with physics constraints.
+    Uses graph structure (edges/hyperedges) for encoding but generates only particles.
     
-    Architecture Overview:
-    1. Encoder: Processes particles → latent distribution q(z|x)
-    2. Latent sampling: z ~ q(z|x) via reparameterization trick
-    3. Decoder: Generates particles, edges, hyperedges from z
-    4. Loss: Reconstruction (Chamfer) + KL divergence + auxiliary losses
+    Architecture:
+    1. Encoder: Particles + graph observables → latent q(z|x)
+    2. Latent: z ~ q(z|x) via reparameterization trick
+    3. Decoder: z → particles (4-momenta) + jet features
+    4. Loss: Chamfer + Distribution matching + Jet features + Consistency + KL
     
-    Key Innovation:
-    - Uses L-GATr (Lorentz Group Attention) for physics-preserving transformations
-    - Squared distance Chamfer loss prevents gradient vanishing (∇d² = 2x vs ∇√d² = 1/(2√x))
-    - Multi-scale loss: particle-level + edge-level + jet-level features
+    Key Innovations:
+    - Hyperbolic Chamfer loss: Better captures hierarchical jet structure
+    - Distribution losses: Match 2-pt (edge) and N-pt (hyperedge) correlations
+    - Local→global consistency: Particles sum to correct jet-level observables
+    - Graph-informed encoding: Uses pre-computed edge/hyperedge observables
     
-    Input Format (PyTorch Geometric Data):
-    - particle_x: [N_total_particles, 4] - particle 4-vectors (E, px, py, pz)
-    - edge_index: [2, N_edges] - bipartite connectivity
-    - edge_attr: [N_edges, 5] - edge features (ln_delta, ln_kt, etc.)
-    - hyperedge_x: [N_hyperedges, 2] - hyperedge features (3pt_eec, 4pt_eec)
-    - y: [batch_size, 4] - jet features (jet_type, jet_pt, jet_eta, jet_mass)
-    - n_particles: [batch_size] - number of particles per jet
+    Input (PyTorch Geometric Data):
+    - particle_x: [N, 4] - 4-momenta (E, px, py, pz)
+    - edge_attr: [M, 5] - Edge observables [2pt_EEC, ln_delta, ln_kT, ln_z, ln_m2]
+    - hyperedge_attr: [K, features] - N-point correlations [3pt_EEC, 4pt_EEC, ...]
+    - y: [batch, 4] - Jet features [jet_type, jet_pt, jet_eta, jet_mass]
     
     Output:
-    - Reconstructed particles, edges, hyperedges
-    - Latent distribution parameters (mu, logvar)
-    - Topology information (masks, multiplicities)
+    - Reconstructed particles (4-momenta)
+    - Jet-level features (pt, eta, mass)
+    - Latent parameters (mu, logvar)
     """
     
     def __init__(self, config):
@@ -151,11 +159,6 @@ class BipartiteHyperVAE(nn.Module):
         self.jet_mass_weight = self.loss_config.get('jet_mass_weight', 2.0)  # Often most important
         self.jet_n_constituents_weight = self.loss_config.get('jet_n_constituents_weight', 1.0)
         
-        # === Auxiliary Loss Configuration ===
-        # Edges/hyperedges are auxiliary: weighted lower than main particle loss
-        self.use_auxiliary_losses = config['model'].get('use_auxiliary_losses', True)
-        self.auxiliary_loss_weight = config['model'].get('auxiliary_loss_weight', 0.1)  # Typically 0.1
-        
         # === Local→Global Physics Consistency Loss ===
         # Enforces agreement between particle 4-momenta and jet-level observables
         self.use_consistency_loss = self.loss_config.get('use_consistency_loss', True)
@@ -163,9 +166,54 @@ class BipartiteHyperVAE(nn.Module):
         self.consistency_eta_weight = self.loss_config.get('consistency_eta_weight', 1.0)
         self.consistency_mass_weight = self.loss_config.get('consistency_mass_weight', 2.5)
         
+        # === Edge/Hyperedge Distribution Loss (Wasserstein-based) ===
+        # Compute edge/hyperedge observables from particles and match distributions
+        self.use_distribution_loss = self.loss_config.get('use_distribution_loss', False)
+        self.edge_distribution_weight = self.loss_weights.get('edge_distribution', 1.0)
+        self.hyperedge_distribution_weight = self.loss_weights.get('hyperedge_distribution', 1.0)
+        
+        # Normalization statistics for edge/hyperedge observables
+        self.edge_norm_stats = self.loss_config.get('edge_norm_stats', {})
+        self.hyperedge_norm_stats = self.loss_config.get('hyperedge_norm_stats', {})
+        
+        # EEC computation parameters (for hyperedge features)
+        self.eec_prop = self.loss_config.get('eec_prop', [[2, 3], 200, [1e-4, 2]])
+        
+        # Cache normalization stats as tensors for faster access
+        self._cache_norm_stats_tensors()
+        
         # === Regularization ===
         # Latent noise during training (variational dropout for robustness)
         self.latent_noise_std = config['training'].get('latent_noise', 0.0)
+    
+    def _cache_norm_stats_tensors(self):
+        """
+        Pre-compute normalization stats as tensors for faster denormalization.
+        Converts dict lookups to tensor operations (major speedup).
+        """
+        if not self.use_distribution_loss:
+            return
+        
+        # Cache particle normalization stats
+        if hasattr(self, 'edge_norm_stats') and self.edge_norm_stats:
+            # Pre-compute edge normalizers (includes 2pt_EEC + edge observables)
+            self.edge_normalizers = {}
+            for key in ['2pt_EEC', 'ln_delta', 'ln_kT', 'ln_z', 'ln_m2']:
+                if key in self.edge_norm_stats:
+                    stats = self.edge_norm_stats[key]
+                    if stats.get('method') == 'zscore':
+                        self.edge_normalizers[key] = stats.get('std', 1.0)
+                    else:
+                        self.edge_normalizers[key] = stats.get('max', 1.0) - stats.get('min', 0.0)
+        
+        # Cache hyperedge normalizers
+        if hasattr(self, 'hyperedge_norm_stats') and self.hyperedge_norm_stats:
+            self.hyperedge_normalizers = {}
+            for key, stats in self.hyperedge_norm_stats.items():
+                if stats.get('method') == 'zscore':
+                    self.hyperedge_normalizers[key] = stats.get('std', 1.0)
+                else:
+                    self.hyperedge_normalizers[key] = stats.get('max', 1.0) - stats.get('min', 0.0)
     
     def reparameterize(self, mu, logvar, add_noise=True):
         """
@@ -242,8 +290,8 @@ class BipartiteHyperVAE(nn.Module):
                 
             generate_all_features: bool or None
                 - None: Auto-detect (True for training, False for eval)
-                - True: Generate edges/hyperedges (needed for auxiliary losses)
-                - False: Only particles (faster inference)
+                - True: Generate edges/hyperedges (legacy, not used)
+                - False: Only particles (current default)
         
         Returns:
             dict with keys:
@@ -271,20 +319,11 @@ class BipartiteHyperVAE(nn.Module):
         z = self.reparameterize(mu, logvar)
         
         # === DECODING PHASE ===
-        # Determine what features to generate (particles always, edges/hyperedges optional)
-        if generate_all_features is None:
-            # Auto-detect: training needs all features, inference can skip auxiliary
-            generate_all_features = self.training
-        
-        # Generate reconstructions from latent code
-        # During training: generate all features for auxiliary losses
-        # During inference: only generate particles (faster, sufficient for evaluation)
+        # Generate reconstructions from latent code (particles only - decoder no longer outputs edges/hyperedges)
         output = self.decoder(
             z, 
             batch.jet_type,  # Condition on jet type (quark/gluon/top)
-            temperature,     # Controls sharpness of topology assignments
-            generate_edges=generate_all_features and self.use_auxiliary_losses,
-            generate_hyperedges=generate_all_features and self.use_auxiliary_losses
+            temperature      # Controls sharpness of topology assignments
         )
         
         # === ATTACH LATENT PARAMETERS ===
@@ -297,16 +336,15 @@ class BipartiteHyperVAE(nn.Module):
     
     def compute_loss(self, batch, output, epoch=0):
         """
-        Compute total VAE loss: Reconstruction + KL Divergence + Auxiliary Losses + Physics Consistency.
+        Compute total VAE loss: Reconstruction + KL Divergence + Distribution Matching + Physics Consistency.
         
         Loss Formulation:
-            L_total = L_particle + w_aux * (L_edge + L_hyperedge) + w_jet * L_jet + 
-                      w_cons * L_consistency + β(epoch) * L_KL
+            L_total = L_particle + L_edge_dist + L_hyperedge_dist + L_jet + L_consistency + β(epoch) * L_KL
         
         Where:
         - L_particle: Chamfer distance between true and predicted particles (MAIN LOSS)
-        - L_edge: MSE for pairwise edge features (ln_delta, ln_kt, etc.)
-        - L_hyperedge: MSE for higher-order features (3pt_eec, 4pt_eec)
+        - L_edge_dist: Wasserstein distance for edge observable distributions (2-pt EEC, ln_delta, etc.)
+        - L_hyperedge_dist: Wasserstein distance for hyperedge distributions (3-pt+ EEC)
         - L_jet: Weighted MSE for jet-level features (jet_pt, jet_eta, jet_mass, n_constituents)
         - L_consistency: Local→global physics consistency (particles sum to jet observables)
         - L_KL: KL divergence between q(z|x) and p(z)=N(0,I)
@@ -314,9 +352,9 @@ class BipartiteHyperVAE(nn.Module):
         
         Loss Weights:
         - particle_features: 12000.0 (main objective)
-        - edge_features: 2500.0 * w_aux (auxiliary)
-        - hyperedge_features: 1500.0 * w_aux (auxiliary)
-        - jet_features: 6000.0 (constrain jet-level properties)
+        - edge_distribution: 1.0 (edge observable matching)
+        - hyperedge_distribution: 1.0 (hyperedge observable matching)
+        - jet_features: 3000.0 (constrain jet-level properties)
         - local_global_consistency: 3000.0 (physics constraint)
         - kl_divergence: 0.3 * β(epoch) (annealed regularization)
         
@@ -328,8 +366,8 @@ class BipartiteHyperVAE(nn.Module):
         Returns:
             dict with individual and total losses:
                 - 'particle': Particle reconstruction loss
-                - 'edge': Edge reconstruction loss (0 if disabled)
-                - 'hyperedge': Hyperedge reconstruction loss (0 if disabled)
+                - 'edge_distribution': Edge distribution matching loss (0 if disabled)
+                - 'hyperedge_distribution': Hyperedge distribution matching loss (0 if disabled)
                 - 'jet': Jet feature loss
                 - 'consistency': Local→global physics consistency loss
                 - 'kl': KL divergence
@@ -338,8 +376,8 @@ class BipartiteHyperVAE(nn.Module):
                 - 'total': Weighted sum of all losses
         
         Note:
-            Auxiliary losses (edges/hyperedges) only computed during training.
-            This saves computation during validation/inference.
+            Edge/hyperedge losses are computed from generated particles (not decoder outputs).
+            Distribution matching uses Wasserstein distance on observable features.
         """
         # Fix batch.y shape if needed (PyG concatenates [4] tensors into [batch_size*4])
         if batch.y.dim() == 1 and hasattr(batch, 'num_graphs'):
@@ -351,49 +389,39 @@ class BipartiteHyperVAE(nn.Module):
         # Chamfer distance: Permutation-invariant set matching
         # Measures how well predicted particle set matches true particle set
         particle_loss = self._particle_reconstruction_loss(
-            batch, output['particle_features'], output['topology']['particle_mask']
+            batch, output['particle_features'], output['particle_mask']
         )
         losses['particle'] = particle_loss
         
-        # === 2. AUXILIARY LOSSES (EDGES & HYPEREDGES) ===
-        # Only computed during training to guide learning of particle relationships
-        # Disabled during validation/inference for speed
-        if self.training and self.use_auxiliary_losses:
-            # Edge feature auxiliary loss
-            if output.get('edge_features') is not None and batch.edge_attr.size(0) > 0:
-                edge_loss = self._edge_reconstruction_loss(batch, output['edge_features'])
-                losses['edge'] = edge_loss
-            else:
-                losses['edge'] = torch.tensor(0.0, device=batch.x.device)
-            
-            # Hyperedge feature auxiliary loss
-            if output.get('hyperedge_features') is not None:
-                hyperedge_loss = self._hyperedge_reconstruction_loss(
-                    batch, output['hyperedge_features'], output['topology']['hyperedge_mask']
-                )
-                losses['hyperedge'] = hyperedge_loss
-            else:
-                losses['hyperedge'] = torch.tensor(0.0, device=batch.x.device)
+        # === 2. DISTRIBUTION LOSS (EDGE/HYPEREDGE FROM PARTICLES) ===
+        # Compute edge/hyperedge observables from generated particles
+        # Match distributions using Wasserstein distance
+        if self.use_distribution_loss:
+            distribution_losses = self._edge_hyperedge_wasserstein_loss(
+                batch, output['particle_features'], output['particle_mask']
+            )
+            losses['edge_distribution'] = distribution_losses['edge']
+            losses['hyperedge_distribution'] = distribution_losses['hyperedge']
         else:
-            losses['edge'] = torch.tensor(0.0, device=batch.x.device)
-            losses['hyperedge'] = torch.tensor(0.0, device=batch.x.device)
+            losses['edge_distribution'] = torch.tensor(0.0, device=batch.x.device)
+            losses['hyperedge_distribution'] = torch.tensor(0.0, device=batch.x.device)
         
-        # 4. Jet feature loss (ALWAYS computed - includes N_constituents)
+        # === 3. JET FEATURE LOSS ===
         # Pass topology information for N_constituents prediction
         jet_loss = self._jet_feature_loss(batch, output['jet_features'], output['topology'])
         losses['jet'] = jet_loss
         
-        # 5. Local→Global Physics Consistency Loss
+        # === 4. LOCAL→GLOBAL PHYSICS CONSISTENCY LOSS ===
         # Enforces that generated particles sum to correct jet-level observables
         if self.use_consistency_loss:
             consistency_loss = self._local_global_consistency_loss(
-                batch, output['particle_features'], output['topology']['particle_mask']
+                batch, output['particle_features'], output['particle_mask']
             )
             losses['consistency'] = consistency_loss
         else:
             losses['consistency'] = torch.tensor(0.0, device=batch.x.device)
         
-        # 6. KL divergence
+        # === 5. KL DIVERGENCE ===
         kl_loss = self._kl_divergence(output['mu'], output['logvar'])
         
         # KL annealing with cyclical schedule support
@@ -420,13 +448,11 @@ class BipartiteHyperVAE(nn.Module):
         losses['kl'] = kl_loss
         losses['kl_raw'] = kl_loss.item()  # Log raw KL for monitoring
         
-        # Total loss with auxiliary weight
-        # Auxiliary losses are weighted by auxiliary_loss_weight (typically 0.1)
-        # Note: topology loss removed - N_constituents now part of jet loss
+        # === TOTAL LOSS ===
         total_loss = (
             self.loss_weights['particle_features'] * losses['particle'] +
-            self.auxiliary_loss_weight * self.loss_weights['edge_features'] * losses['edge'] +
-            self.auxiliary_loss_weight * self.loss_weights['hyperedge_features'] * losses['hyperedge'] +
+            self.loss_weights.get('edge_distribution', 0.0) * losses.get('edge_distribution', 0.0) +
+            self.loss_weights.get('hyperedge_distribution', 0.0) * losses.get('hyperedge_distribution', 0.0) +
             self.loss_weights['jet_features'] * losses['jet'] +
             self.loss_weights.get('local_global_consistency', 0.0) * losses['consistency'] +
             self.loss_weights['kl_divergence'] * kl_weight * losses['kl']
@@ -1079,29 +1105,59 @@ class BipartiteHyperVAE(nn.Module):
         return torch.tensor(total_loss / max(valid_count, 1), device=batch.x.device)
     
     def _edge_reconstruction_loss(self, batch, pred_features):
-        """Edge feature loss - MSE for training, Wasserstein for evaluation"""
-        true_features = batch.edge_attr
+        """
+        Edge feature loss - Distribution matching approach.
+        
+        Similar to hyperedge loss: decoder predicts limited edges while dataset
+        has full pairwise set. Match statistical distributions for guidance.
+        
+        Uses:
+        - Training: MSE on mean + std + higher moments
+        - Evaluation: Wasserstein distance
+        """
+        true_features = batch.edge_attr  # [total_edges_in_batch, num_features]
         
         if true_features.size(0) == 0:
             return torch.tensor(0.0, device=pred_features.device)
         
+        # Get number of features
+        num_features = true_features.shape[-1]
+        
+        # Flatten predicted features
+        pred_flat = pred_features.reshape(-1, num_features)  # [batch*max_edges, num_features]
+        
         if self.training or self.evaluation_metric != 'wasserstein':
-            # Training: use MSE distribution matching
-            true_mean = true_features.mean(dim=0)
-            num_features = true_features.shape[-1]
-            pred_mean = pred_features.reshape(-1, num_features).mean(dim=0)
-            loss = F.mse_loss(pred_mean, true_mean)
+            # Training: Match distribution moments (mean, std, skewness)
             
-            if torch.isnan(loss):
+            # 1. Match means
+            true_mean = true_features.mean(dim=0)  # [num_features]
+            pred_mean = pred_flat.mean(dim=0)  # [num_features]
+            mean_loss = F.mse_loss(pred_mean, true_mean)
+            
+            # 2. Match standard deviations
+            true_std = true_features.std(dim=0) + 1e-6  # [num_features]
+            pred_std = pred_flat.std(dim=0) + 1e-6  # [num_features]
+            std_loss = F.mse_loss(pred_std, true_std)
+            
+            # 3. Match higher moments (distribution shape)
+            true_centered = (true_features - true_mean) / true_std
+            pred_centered = (pred_flat - pred_mean) / pred_std
+            true_moment3 = (true_centered ** 3).mean(dim=0)
+            pred_moment3 = (pred_centered ** 3).mean(dim=0)
+            moment3_loss = F.mse_loss(pred_moment3, true_moment3)
+            
+            # Weighted combination
+            loss = 0.5 * mean_loss + 0.3 * std_loss + 0.2 * moment3_loss
+            
+            if torch.isnan(loss) or torch.isinf(loss):
                 return torch.tensor(0.0, device=pred_features.device)
             return loss
         else:
             # Evaluation: use Wasserstein distance
             true_np = true_features.cpu().numpy()
-            pred_np = pred_features.reshape(-1, true_features.shape[-1]).cpu().numpy()
+            pred_np = pred_flat.cpu().numpy()
             
             total_w_dist = 0.0
-            num_features = true_np.shape[1]
             
             for feat_idx in range(num_features):
                 w_dist = wasserstein_distance(true_np[:, feat_idx], pred_np[:, feat_idx])
@@ -1111,29 +1167,72 @@ class BipartiteHyperVAE(nn.Module):
             return torch.tensor(total_w_dist / num_features, device=pred_features.device)
     
     def _hyperedge_reconstruction_loss(self, batch, pred_features, pred_mask):
-        """Hyperedge feature loss - MSE for training, Wasserstein for evaluation"""
-        true_features = batch.hyperedge_attr
+        """
+        Hyperedge feature loss - Distribution matching approach.
+        
+        Since decoder predicts limited hyperedges (e.g., 20) while dataset has full
+        combinatorial set (e.g., C(30,3)=4060), we match statistical distributions
+        rather than per-hyperedge alignment.
+        
+        Uses:
+        - Training: MSE on mean + std + higher moments
+        - Evaluation: Wasserstein distance
+        """
+        true_features = batch.hyperedge_attr  # [total_hyperedges_in_batch, num_features]
         
         if true_features.size(0) == 0:
             return torch.tensor(0.0, device=pred_features.device)
         
+        # Get number of features
+        num_features = true_features.shape[-1]
+        
+        # Flatten predicted features and apply mask
+        # pred_features: [batch, max_hyperedges, num_features]
+        # pred_mask: [batch, max_hyperedges]
+        pred_flat = pred_features.reshape(-1, num_features)  # [batch*max_hyperedges, num_features]
+        mask_flat = pred_mask.reshape(-1)  # [batch*max_hyperedges]
+        
+        # Keep only valid (masked) predictions
+        pred_valid = pred_flat[mask_flat > 0.5]  # [num_valid_predictions, num_features]
+        
+        if pred_valid.size(0) == 0:
+            return torch.tensor(0.0, device=pred_features.device)
+        
         if self.training or self.evaluation_metric != 'wasserstein':
-            # Training: use MSE distribution matching
-            true_mean = true_features.mean(dim=0)
-            num_features = true_features.shape[-1]
-            pred_mean = pred_features.reshape(-1, num_features).mean(dim=0)
-            loss = F.mse_loss(pred_mean, true_mean)
+            # Training: Match distribution moments (mean, std, skewness)
+            # This ensures generated hyperedges have similar statistical properties
             
-            if torch.isnan(loss):
+            # 1. Match means
+            true_mean = true_features.mean(dim=0)  # [num_features]
+            pred_mean = pred_valid.mean(dim=0)  # [num_features]
+            mean_loss = F.mse_loss(pred_mean, true_mean)
+            
+            # 2. Match standard deviations (distribution spread)
+            true_std = true_features.std(dim=0) + 1e-6  # [num_features]
+            pred_std = pred_valid.std(dim=0) + 1e-6  # [num_features]
+            std_loss = F.mse_loss(pred_std, true_std)
+            
+            # 3. Match higher moments (distribution shape)
+            # Normalized third moment (skewness-like)
+            true_centered = (true_features - true_mean) / true_std
+            pred_centered = (pred_valid - pred_mean) / pred_std
+            true_moment3 = (true_centered ** 3).mean(dim=0)
+            pred_moment3 = (pred_centered ** 3).mean(dim=0)
+            moment3_loss = F.mse_loss(pred_moment3, true_moment3)
+            
+            # Weighted combination (mean is most important)
+            loss = 0.5 * mean_loss + 0.3 * std_loss + 0.2 * moment3_loss
+            
+            if torch.isnan(loss) or torch.isinf(loss):
                 return torch.tensor(0.0, device=pred_features.device)
             return loss
         else:
-            # Evaluation: use Wasserstein distance
+            # Evaluation: use Wasserstein distance (Earth Mover's Distance)
+            # Measures minimum cost to transform one distribution into another
             true_np = true_features.cpu().numpy()
-            pred_np = pred_features.reshape(-1, true_features.shape[-1]).cpu().numpy()
+            pred_np = pred_valid.cpu().numpy()
             
             total_w_dist = 0.0
-            num_features = true_np.shape[1]
             
             for feat_idx in range(num_features):
                 w_dist = wasserstein_distance(true_np[:, feat_idx], pred_np[:, feat_idx])
@@ -1141,12 +1240,6 @@ class BipartiteHyperVAE(nn.Module):
             
             # Average over features
             return torch.tensor(total_w_dist / num_features, device=pred_features.device)
-        
-        # Safety check
-        if torch.isnan(loss):
-            return torch.tensor(0.0, device=pred_features.device)
-        
-        return loss
     
     def _topology_loss(self, batch, topology):
         """Topology prediction loss with robust normalization and clamping"""
@@ -1174,7 +1267,7 @@ class BipartiteHyperVAE(nn.Module):
         Compute weighted MSE loss for jet-level observables.
         
         ═══════════════════════════════════════════════════════════════════════
-        JET-LEVEL CONSTRAINTS - PHYSICS-MOTIVATED AUXILIARY LOSS
+        JET-LEVEL CONSISTENCY LOSS - PHYSICS-MOTIVATED CONSTRAINT
         ═══════════════════════════════════════════════════════════════════════
         
         Purpose:
@@ -1505,14 +1598,14 @@ class BipartiteHyperVAE(nn.Module):
         if is_zscore:
             # For z-score: use std of physical (exponentiated) values
             # η is already physical, pT and mass are exponentiated from log-space
-            pt_residual_scale = true_jet_pt.std() + 1e-8      # std of exp(log_pt)
-            eta_residual_scale = eta_stats['std'] + 1e-8    # std of eta (already physical)
-            mass_residual_scale = true_jet_mass.std() + 1e-8  # std of exp(log_mass)
+            pt_residual_scale = true_jet_pt.std()      # std of exp(log_pt)
+            eta_residual_scale = eta_stats['std']    # std of eta (already physical)
+            mass_residual_scale = true_jet_mass.std()  # std of exp(log_mass)
         else:  # minmax
             # For minmax: use range (max - min) of physical values
-            pt_residual_scale = (true_jet_pt.max() - true_jet_pt.min()) + 1e-8
-            eta_residual_scale = eta_stats['max'] - eta_stats['min'] + 1e-8
-            mass_residual_scale = (true_jet_mass.max() - true_jet_mass.min()) + 1e-8
+            pt_residual_scale = (true_jet_pt.max() - true_jet_pt.min())
+            eta_residual_scale = eta_stats['max'] - eta_stats['min']
+            mass_residual_scale = (true_jet_mass.max() - true_jet_mass.min())
         
         # === VECTORIZED RESIDUALS & MASKING ===
         # Filter to jets with at least one valid particle
@@ -1681,6 +1774,340 @@ class BipartiteHyperVAE(nn.Module):
             return torch.tensor(0.0, device=mu.device)
         
         return kl_mean
+    
+    def _denorm_to_pt_eta_phi(self, x_norm, particle_norm_stats):
+        """
+        Denormalize particles and convert to (pt, eta, phi) coordinates.
+        Supports both single jet [N, 4] and batched [B, N, 4] tensors.
+        
+        Args:
+            x_norm: [N, 4] or [B, N, 4] normalized (E, px, py, pz)
+            particle_norm_stats: dict with normalization stats for each component
+        
+        Returns:
+            E, px, py, pz, pt, eta, phi: tensors matching input shape
+        """
+        device = x_norm.device
+        method = particle_norm_stats['E']['method']
+        
+        # Denormalize based on method
+        if method == 'zscore':
+            E = x_norm[..., 0] * particle_norm_stats['E']['std'] + particle_norm_stats['E']['mean']
+            px = x_norm[..., 1] * particle_norm_stats['px']['std'] + particle_norm_stats['px']['mean']
+            py = x_norm[..., 2] * particle_norm_stats['py']['std'] + particle_norm_stats['py']['mean']
+            pz = x_norm[..., 3] * particle_norm_stats['pz']['std'] + particle_norm_stats['pz']['mean']
+        else:  # minmax
+            E_range = particle_norm_stats['E']['max'] - particle_norm_stats['E']['min']
+            px_range = particle_norm_stats['px']['max'] - particle_norm_stats['px']['min']
+            py_range = particle_norm_stats['py']['max'] - particle_norm_stats['py']['min']
+            pz_range = particle_norm_stats['pz']['max'] - particle_norm_stats['pz']['min']
+            
+            E = x_norm[..., 0] * E_range + particle_norm_stats['E']['min']
+            px = x_norm[..., 1] * px_range + particle_norm_stats['px']['min']
+            py = x_norm[..., 2] * py_range + particle_norm_stats['py']['min']
+            pz = x_norm[..., 3] * pz_range + particle_norm_stats['pz']['min']
+        
+        # Compute pt, eta, phi
+        pt = torch.sqrt(px**2 + py**2 + 1e-12)
+        phi = torch.atan2(py, px)
+        eta = torch.asinh(pz / (pt + 1e-12))
+        
+        return E, px, py, pz, pt, eta, phi
+
+    
+    def _compute_edge_observables_vectorized(self, E, px, py, pz, pt, eta, phi):
+        """
+        Compute edge observables for all pairs in a single jet (fully vectorized, tensor-based).
+        This is identical to _compute_pair_features_fast but kept separate for clarity.
+        
+        Args:
+            E, px, py, pz, pt, eta, phi: torch tensors [N] for N particles (already denormalized)
+        
+        Returns:
+            dict with 'ln_delta', 'ln_kT', 'ln_z', 'ln_m2' as torch tensors, or None if < 2 particles
+        """
+        N = pt.shape[0]
+        if N < 2:
+            return None
+        
+        # Generate all pairs (i < j) - vectorized
+        i_idx, j_idx = torch.triu_indices(N, N, offset=1, device=pt.device)
+        
+        # Angular distance with phi wrap-around
+        delta_eta = eta[i_idx] - eta[j_idx]
+        delta_phi_raw = phi[i_idx] - phi[j_idx]
+        delta_phi = torch.where(
+            torch.abs(delta_phi_raw) <= math.pi,
+            torch.abs(delta_phi_raw),
+            2 * math.pi - torch.abs(delta_phi_raw)
+        )
+        delta_R = torch.sqrt(delta_eta**2 + delta_phi**2 + 1e-12)
+        
+        # Compute observables (vectorized)
+        pt_min = torch.minimum(pt[i_idx], pt[j_idx])
+        k_T = pt_min * delta_R
+        z = pt_min / (pt[i_idx] + pt[j_idx] + 1e-12)
+        
+        # Invariant mass squared (using already-computed 4-momenta, no recalculation!)
+        E_sum = E[i_idx] + E[j_idx]
+        px_sum = px[i_idx] + px[j_idx]
+        py_sum = py[i_idx] + py[j_idx]
+        pz_sum = pz[i_idx] + pz[j_idx]
+        m2 = torch.clamp(E_sum**2 - (px_sum**2 + py_sum**2 + pz_sum**2), min=1e-12)
+        
+        # Log-transform (IRC-safe)
+        ln_delta = torch.log(delta_R + 1e-12)
+        ln_kT = torch.log(k_T + 1e-12)
+        ln_z = torch.log(z + 1e-12)
+        ln_m2 = torch.log(m2)
+        
+        # Mask NaN/Inf (single operation)
+        valid = torch.isfinite(ln_delta) & torch.isfinite(ln_kT) & torch.isfinite(ln_z) & torch.isfinite(ln_m2)
+        
+        return {
+            'ln_delta': ln_delta[valid],
+            'ln_kT': ln_kT[valid],
+            'ln_z': ln_z[valid],
+            'ln_m2': ln_m2[valid]
+        }
+    
+    def _edge_hyperedge_wasserstein_loss(self, batch, pred_particles, pred_mask):
+        """
+        FULLY VECTORIZED & BATCHED: Compute Wasserstein distance between edge/hyperedge distributions.
+        
+        Edge Loss (2-pt correlations):
+        - Uses PRE-COMPUTED features from dataset (batch.edge_attr):
+          [2pt_EEC, ln_delta, ln_kT, ln_z, ln_m2]
+        - Computes same features from generated particles
+        - Wasserstein distance for distribution matching
+        
+        Hyperedge Loss (3-pt+ correlations):
+        - Computes 3-point+ EEC for both real and generated particles
+        - Uses batched EEC computation (one call per N-point)
+        - Wasserstein distance on EEC histograms
+        
+        Optimization highlights:
+        - No recomputation of real edge features (uses dataset)
+        - Stays in torch tensors until Wasserstein call
+        - Batched EEC matching graph_constructor.py pattern
+        - Minimal loops (only for PyG Batch extraction)
+        
+        Args:
+            batch: PyG Batch with:
+                - x: [N_total, 4] real particles (normalized)
+                - edge_attr: [N_edges, 5] pre-computed edge features
+                - n_particles: [B] particle counts
+                - particle_norm_stats: normalization statistics
+            pred_particles: [B, max_P, 4] normalized predicted (E, px, py, pz)
+            pred_mask: [B, max_P] float mask (sigmoid output) or bool mask
+        
+        Returns:
+            scalar torch.Tensor (edge + hyperedge distribution loss)
+        """
+        if not self.use_distribution_loss:
+            return torch.tensor(0.0, device=pred_particles.device)
+        
+        batch_size = batch.num_graphs
+        device = pred_particles.device
+        particle_norm_stats = batch.particle_norm_stats
+        
+        # Convert pred_mask to boolean
+        if pred_mask.dtype in [torch.float32, torch.float16]:
+            pred_mask = pred_mask > 0.5
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 1: EXTRACT REAL AND GENERATED PARTICLES
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        real_particles_list = []
+        gen_particles_list = []
+        
+        cumulative = 0
+        for i in range(batch_size):
+            n_true = batch.n_particles[i].item()
+            
+            # Real particles [n_true, 4]
+            real_norm = batch.x[cumulative:cumulative + n_true]
+            cumulative += n_true
+            
+            # Generated particles [n_pred, 4]
+            gen_norm = pred_particles[i][pred_mask[i]]
+            
+            # Skip jets with < 2 particles
+            if real_norm.shape[0] >= 2:
+                real_particles_list.append(real_norm)
+            if gen_norm.shape[0] >= 2:
+                gen_particles_list.append(gen_norm)
+        
+        if len(real_particles_list) == 0 or len(gen_particles_list) == 0:
+            return torch.tensor(0.0, device=device)
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 2: EXTRACT REAL EDGE FEATURES 
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # Real edge features are already computed in dataset: [2pt_EEC, ln_delta, ln_kT, ln_z, ln_m2]
+        # Extract them directly from batch.edge_attr 
+        real_edge_features = batch.edge_attr  # [total_edges, 5]
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 3: COMPUTE GENERATED EDGE FEATURES (from predicted particles)
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        gen_edge_obs = []
+        gen_pt_eta_phi_list = []  # For 3-pt+ EEC computation
+        
+        # Process generated particles
+        for gen_norm in gen_particles_list:
+            E, px, py, pz, pt, eta, phi = self._denorm_to_pt_eta_phi(gen_norm, particle_norm_stats)
+            
+            # Compute edge observables (stays in torch tensors - fast!)
+            obs = self._compute_edge_observables_vectorized(E, px, py, pz, pt, eta, phi)
+            if obs is not None:
+                gen_edge_obs.append(obs)
+            
+            # Store (pt, eta, phi) for 3-pt+ EEC computation
+            gen_pt_eta_phi = torch.stack([pt, eta, phi], dim=1)
+            gen_pt_eta_phi_list.append(gen_pt_eta_phi)
+        
+        # Also prepare real particles for 3-pt+ EEC (only denormalize for EEC, not edge features)
+        real_pt_eta_phi_list = []
+        for real_norm in real_particles_list:
+            E, px, py, pz, pt, eta, phi = self._denorm_to_pt_eta_phi(real_norm, particle_norm_stats)
+            real_pt_eta_phi = torch.stack([pt, eta, phi], dim=1)
+            real_pt_eta_phi_list.append(real_pt_eta_phi)
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 4: EDGE WASSERSTEIN DISTANCES (2-pt EEC + edge observables)
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        edge_loss = 0.0
+        edge_count = 0
+        
+        if real_edge_features.shape[0] > 0 and gen_edge_obs:
+            # Real edge features: [total_edges, 5] = [2pt_EEC, ln_delta, ln_kT, ln_z, ln_m2]
+            # Concatenate generated edge observables
+            gen_edges_stacked = {key: torch.cat([obs[key] for obs in gen_edge_obs]) 
+                                for key in gen_edge_obs[0].keys()}
+            
+            # Feature names in dataset order
+            feature_names = ['2pt_EEC', 'ln_delta', 'ln_kT', 'ln_z', 'ln_m2']
+            
+            # Compute Wasserstein for each observable
+            for idx, key in enumerate(feature_names):
+                # Real values from pre-computed dataset features (NORMALIZED)
+                # Need to DENORMALIZE before comparing to generated (physical) values
+                real_vals_norm = real_edge_features[:, idx]
+                
+                # Denormalize real features to physical space
+                if key in self.edge_norm_stats:
+                    stats = self.edge_norm_stats[key]
+                    if stats['method'] == 'zscore':
+                        real_vals = real_vals_norm * stats['std'] + stats['mean']
+                    else:  # minmax
+                        real_vals = real_vals_norm * (stats['max'] - stats['min']) + stats['min']
+                else:
+                    # No normalization stats, assume already physical
+                    real_vals = real_vals_norm
+                
+                real_vals = real_vals.cpu().numpy()
+                
+                # Generated values (for 2pt_EEC we need to compute it, for others we have them)
+                if key == '2pt_EEC':
+                    # Compute 2-pt EEC for generated particles
+                    # Convert generated pt/eta/phi to numpy for EEC library
+                    gen_pt_eta_phi_numpy = [x.cpu().detach().numpy() for x in gen_pt_eta_phi_list]
+                    gen_eec = get_eec_ls_values(gen_pt_eta_phi_numpy, N=2, bins=self.eec_prop[1], axis_range=self.eec_prop[2], print_every=0)
+                    gen_vals = np.array(gen_eec.get_hist_errs(0, False)[0])
+                    with np.errstate(divide='ignore'):
+                        gen_vals = np.where(gen_vals > 0, np.log(gen_vals), 0.0)  # The EECs are log-transformed
+                else:
+                    # Use computed edge observables (already in physical space)
+                    edge_key_map = {'ln_delta': 'ln_delta', 'ln_kT': 'ln_kT', 'ln_z': 'ln_z', 'ln_m2': 'ln_m2'}
+                    gen_vals = gen_edges_stacked[edge_key_map[key]].cpu().detach().numpy()
+                
+                if len(real_vals) >= 2 and len(gen_vals) >= 2:
+                    W = wasserstein_distance(real_vals, gen_vals)
+                    normalizer = getattr(self, 'edge_normalizers', {}).get(key, 1.0)
+                    edge_loss += W / (normalizer + 1e-8)
+                    edge_count += 1
+            
+            if edge_count > 0:
+                edge_loss = edge_loss / edge_count
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 5: HYPEREDGE (3-pt+ EEC) WASSERSTEIN - BATCHED COMPUTATION
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        hyperedge_loss = 0.0
+        
+        if self.hyperedge_distribution_weight > 0:
+            try:
+                # Real 3-pt+ EEC values are PRE-COMPUTED in dataset (batch.hyperedge_attr)
+                # hyperedge_attr columns: [3pt_EEC, 4pt_EEC, ...] depending on N_points config
+                real_hyperedge_features = batch.hyperedge_attr  # [total_hyperedges, num_N_points]
+                
+                if real_hyperedge_features.shape[0] > 0:
+                    N_points = self.eec_prop[0]  # e.g., [2, 3, 4]
+                    bins = self.eec_prop[1]
+                    axis_range = self.eec_prop[2]
+                    
+                    # Filter to only 3-pt+ EEC (2-pt is handled in edge loss)
+                    N_points_hyperedge = [n for n in N_points if n >= 3]
+                    
+                    if len(N_points_hyperedge) > 0:
+                        # Convert generated particles to numpy for EEC library
+                        gen_pt_eta_phi_numpy = [x.cpu().detach().numpy() for x in gen_pt_eta_phi_list]
+                        
+                        eec_count = 0
+                        for idx, n in enumerate(N_points_hyperedge):
+                            # Real EEC: extract from pre-computed hyperedge features (NORMALIZED)
+                            # Need to DENORMALIZE before comparing to generated (physical) values
+                            real_hist_norm = real_hyperedge_features[:, idx]
+                            
+                            # Denormalize real hyperedge features to physical space
+                            eec_key = f'{n}pt_EEC'
+                            if eec_key in self.hyperedge_norm_stats:
+                                stats = self.hyperedge_norm_stats[eec_key]
+                                if stats['method'] == 'zscore':
+                                    real_hist = real_hist_norm * stats['std'] + stats['mean']
+                                else:  # minmax
+                                    real_hist = real_hist_norm * (stats['max'] - stats['min']) + stats['min']
+                            else:
+                                # No normalization stats, assume already physical
+                                real_hist = real_hist_norm
+                            
+                            real_hist = real_hist.cpu().numpy()
+                            
+                            # Generated EEC: compute using batched EEC (one call for entire batch)
+                            gen_eec = get_eec_ls_values(gen_pt_eta_phi_numpy, N=n, bins=bins, axis_range=axis_range, print_every=0)
+                            gen_hist = np.array(gen_eec.get_hist_errs(0, False)[0])
+                            with np.errstate(divide='ignore'):
+                                gen_hist = np.where(gen_hist > 0, np.log(gen_hist), 0.0)  # The EECs are log-transformed
+                            
+                            if len(real_hist) > 0 and len(gen_hist) > 0:
+                                W_eec = wasserstein_distance(real_hist, gen_hist)
+                                
+                                # Normalize using cached normalizers
+                                normalizer = getattr(self, 'hyperedge_normalizers', {}).get(eec_key, 1.0)
+                                hyperedge_loss += W_eec / (normalizer + 1e-8)
+                                eec_count += 1
+                        
+                        if eec_count > 0:
+                            hyperedge_loss = hyperedge_loss / eec_count
+                    
+            except Exception as e:
+                # Silent fail for EEC (non-critical)
+                hyperedge_loss = 0.0
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 5: RETURN SEPARATE LOSSES (weighting done in compute_loss)
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        return {
+            'edge': torch.tensor(edge_loss, device=device, dtype=pred_particles.dtype),
+            'hyperedge': torch.tensor(hyperedge_loss, device=device, dtype=pred_particles.dtype)
+        }
     
     def generate(self, num_samples, jet_type, device='cuda'):
         """

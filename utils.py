@@ -255,7 +255,7 @@ def construct_n_point_hyperedges(num_nodes, old_x, additional_hypergraph_attrs, 
         for node in hyperedge:
             row_indices.append(node)
             col_indices.append(hyperedge_id)
-    hyperedge_index = torch.tensor([row_indices, col_indices], dtype=torch.long)
+    hyperedge_index = torch.tensor([row_indices, col_indices], dtype=torch.int32)
 
     # Convert the list of hyperedge attributes to a tensor
     hyperedge_attr = torch.tensor(all_hyperedge_attrs, dtype=torch.float32)
@@ -263,7 +263,7 @@ def construct_n_point_hyperedges(num_nodes, old_x, additional_hypergraph_attrs, 
     return hyperedge_index, hyperedge_attr
 
 
-def get_eec_ls_values(data, N = 2, bins = 50, axis_range = (1e-3, 1)):
+def get_eec_ls_values(data, N = 2, bins = 50, axis_range = (1e-3, 1), print_every=-10):
     """
     Get the EEC values for the given data.
     
@@ -274,8 +274,8 @@ def get_eec_ls_values(data, N = 2, bins = 50, axis_range = (1e-3, 1)):
         The number of nearest neighbors to consider.
     bins: int
         The number of bins to use for the histogram.
-    axis_range: tuple
-        The range of the x-axis.
+    axis_range: tuple or list
+        The range of the x-axis [min, max].
         
     Returns:
     eec_ls: The EEC histogram with the bins and the values.
@@ -284,11 +284,20 @@ def get_eec_ls_values(data, N = 2, bins = 50, axis_range = (1e-3, 1)):
 
     # Get the EEC values
     # Create an instance of the EECLongestSide class
-    eec_ls = eec.EECLongestSideLog(N, bins, axis_range)
+    # Ensure axis_range is a list for the C++ binding (handles tuple, list, or numpy array)
+    if not isinstance(axis_range, list):
+        try:
+            axis_range = list(axis_range)
+        except TypeError:
+            raise TypeError(f"axis_range must be convertible to list, got {type(axis_range)}: {axis_range}")
+    
+    # Ensure elements are Python floats (not numpy types)
+    axis_range = [float(x) for x in axis_range]
+    
+    eec_ls = eec.EECLongestSideLog(N, bins, axis_range, print_every=print_every)
 
     # Multicore compute for EECLongestSide
     eec_ls(data)
-    print(eec_ls)
 
     # Scaling eec values
     eec_ls.scale(1/eec_ls.sum())

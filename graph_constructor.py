@@ -123,7 +123,7 @@ GRAPH_CONSTRUCTION_CONFIG = {
     'graph_structures': ['fully_connected'],
     
     # Number of jets to process
-    'N': 10,
+    'N': 20000,
     
     # Dataset source: 'jetnet' or 'energyflow'
     'dataset': 'jetnet',
@@ -140,7 +140,7 @@ GRAPH_CONSTRUCTION_CONFIG = {
     # N-point orders: [2, 3, 4, ...] for 2-point, 3-point, 4-point EECs
     # bins: number of bins for EEC histograms
     # (R_Lmin, R_Lmax): angular distance range
-    'eec_prop': [[2, 3], 200, (1e-4, 2)],
+    'eec_prop': [[2, 3], 200, [1e-4, 2]],
     
     # Additional feature flags
     'additional_node_attrs': None,
@@ -586,17 +586,39 @@ def _construct_particle_graphs_pyg(
             # Save to file every 85000 iterations
             if (i + 1) % 85000 == 0:
                 partial_graph_filename = os.path.join(output_dir, f"graphs_pyg_{graph_key}_part_{i // 85000 + 1}.pt")
-                torch.save(graph_list, partial_graph_filename)
+                # Save as dict: {'graphs': list, 'metadata': {norm_stats}}
+                save_data = {
+                    'graphs': graph_list,
+                    'metadata': {
+                        'particle_norm_stats': particle_norm_stats,
+                        'jet_norm_stats': jet_norm_stats,
+                        'edge_norm_stats': edge_norm_stats,
+                        'hyperedge_norm_stats': hyperedge_norm_stats
+                    }
+                }
+                torch.save(save_data, partial_graph_filename)
                 print(f'  Saved PyG graphs to {partial_graph_filename}.')
                 saved_filenames.append(partial_graph_filename)
                 graph_list = []
+                gc.collect()  # Free memory after saving
 
         # Save any remaining graphs
         if graph_list:
             final_graph_filename = os.path.join(output_dir, f"graphs_pyg_{graph_key}_final.pt")
-            torch.save(graph_list, final_graph_filename)
+            # Save as dict: {'graphs': list, 'metadata': {norm_stats}}
+            save_data = {
+                'graphs': graph_list,
+                'metadata': {
+                    'particle_norm_stats': particle_norm_stats,
+                    'jet_norm_stats': jet_norm_stats,
+                    'edge_norm_stats': edge_norm_stats,
+                    'hyperedge_norm_stats': hyperedge_norm_stats
+                }
+            }
+            torch.save(save_data, final_graph_filename)
             print(f'  Saved PyG graphs to {final_graph_filename}.')
             saved_filenames.append(final_graph_filename)
+            gc.collect()
             
         # Compute normalization statistics for additional edge features (ln_delta, ln_k_T, ln_z, ln_m2)
         # These are at indices 0-3 in stacked_edges (index 0 is 2pt_EEC which is already normalized, so we skip it)
@@ -631,18 +653,39 @@ def _construct_particle_graphs_pyg(
             print(f'    Applying normalization to {len(saved_filenames)} saved file(s)...')
             edge_idx = 0  # Track position in stacked_edges
             for filename in tqdm.tqdm(saved_filenames, desc=f'  Normalizing edge features: {graph_key}'):
-                graphs = torch.load(filename)
+                # Load the saved data (dict with 'graphs' and 'metadata')
+                saved_data = torch.load(filename)
+                
+                # Handle both old format (list) and new format (dict)
+                if isinstance(saved_data, dict):
+                    graphs = saved_data['graphs']
+                else:
+                    # Old format: just a list of graphs
+                    graphs = saved_data
+                
+                # Normalize edge features in each graph
                 for graph in graphs:
                     if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
                         n_edges = graph.edge_attr.shape[0]
                         # Replace unnormalized edge features (indices 1:) with normalized values
                         graph.edge_attr[:, 1:] = stacked_edges_tensor[edge_idx:edge_idx + n_edges]
                         edge_idx += n_edges
-                    
-                    # Update edge_norm_stats in the graph to include additional features
-                    if hasattr(graph, 'edge_norm_stats'):
-                        graph.edge_norm_stats = edge_norm_stats
-                torch.save(graphs, filename)
+                
+                # Update metadata with complete edge_norm_stats
+                if isinstance(saved_data, dict):
+                    saved_data['metadata']['edge_norm_stats'] = edge_norm_stats
+                    torch.save(saved_data, filename)
+                else:
+                    # Old format: save as new format with metadata
+                    torch.save({
+                        'graphs': graphs,
+                        'metadata': {
+                            'particle_norm_stats': particle_norm_stats,
+                            'jet_norm_stats': jet_norm_stats,
+                            'edge_norm_stats': edge_norm_stats,
+                            'hyperedge_norm_stats': hyperedge_norm_stats
+                        }
+                    }, filename)
             
             print(f'  ✓ Edge features normalized for {graph_key}.')
             print(f'  ✓ Total edges processed: {edge_idx}')
@@ -680,8 +723,10 @@ def _construct_particle_graph_pyg(
     x = x[~np.all(x == 0, axis=1)]  # Remove zero-padded particles
     node_features = torch.tensor(x, dtype=torch.float)
 
-    # Fully-connected graph (all particle pairs)
-    adj_matrix = np.ones((x.shape[0], x.shape[0])) - np.identity((x.shape[0]))
+    # Fully-connected UNDIRECTED graph (all unique particle pairs)
+    # Use upper triangle to avoid creating both (i,j) and (j,i) edges
+    # For n particles: n*(n-1)/2 edges instead of n*(n-1)
+    adj_matrix = np.triu(np.ones((x.shape[0], x.shape[0])), k=1)  # Upper triangle, k=1 excludes diagonal
     row, col = np.where(adj_matrix)
     coo = np.array(list(zip(row, col)))
     edge_indices = torch.tensor(coo)
@@ -802,11 +847,7 @@ def _construct_particle_graph_pyg(
             x=node_features, 
             edge_index=edge_indices_long, 
             edge_attr=edge_features_tensor, 
-            y=graph_label,
-            particle_norm_stats=particle_norm_stats,  # Store particle normalization statistics
-            jet_norm_stats=jet_norm_stats,  # Store jet-level normalization statistics
-            edge_norm_stats=edge_norm_stats,  # Store edge (2-point EEC) normalization statistics
-            hyperedge_norm_stats=hyperedge_norm_stats  # Store hyperedge normalization statistics (may be None)
+            y=graph_label
         )
 
         # Returning all the tensors for normalizing the edge features later
@@ -836,11 +877,22 @@ def _construct_particle_graph_pyg(
             hyperedge_norm_stats=hyperedge_norm_stats,
             normalization_method=normalization_method
         )
-        hyperedge_index = hyperedge_index.to_dense().type(torch.int)  # Convert to full binary coincidence matrix (dense tensor)
+        # hyperedge_index is in edge list format: [2, N_connections]
+        # Each column is [particle_id, hyperedge_id] 
+        # For 3-pt hyperedges: N_connections = 3 × num_hyperedges
+        hyperedge_index = hyperedge_index.type(torch.int32) # Convert to int32 to save memory
         end_time = time.perf_counter()
-        print(f"Time taken to construct hyperedges: {end_time - start_time:.2f} seconds.")
-        # print(hyperedge_index, hyperedge_attr, hyperedge_index.shape, hyperedge_attr.shape)
-        # print(node_features.shape, edge_indices_long.shape, edge_features_tensor.shape, graph_label.shape)
+        
+        # Log hyperedge construction results
+        n_connections = hyperedge_index.shape[1]  # Number of connections
+        num_hyperedges = hyperedge_attr.shape[0]
+        n_points_per_hyperedge = n_connections // num_hyperedges if num_hyperedges > 0 else 0
+        
+        print(f"  ✓ Hyperedges constructed in {end_time - start_time:.2f}s")
+        print(f"    Hyperedge index: [2, {n_connections:,}] edge list (particle-hyperedge connections)")
+        print(f"    Hyperedge features: [{num_hyperedges:,}, {hyperedge_attr.shape[1]}] (hyperedges × n-point EECs)")
+        print(f"    Total hyperedges: {num_hyperedges:,} ({n_points_per_hyperedge}-point each)")
+        # print(f"    Node features: {node_features.shape}, Edges: {edge_indices_long.shape[1]:,}, Edge features: {edge_features_tensor.shape}")
 
     # Construct graph as PyG data object
     if additional_edge_attrs and additional_hypergraph_attrs:
@@ -850,11 +902,7 @@ def _construct_particle_graph_pyg(
             edge_attr=edge_features_tensor,  # Normal edge features.
             hyperedge_index=hyperedge_index,   # Hypergraph incidence (for N-point hyperedges).
             hyperedge_attr=hyperedge_attr,     # N-point EEC features for each hyperedge.
-            y=graph_label,             # Graph label.
-            particle_norm_stats=particle_norm_stats,  # Store particle normalization statistics
-            jet_norm_stats=jet_norm_stats,  # Store jet-level normalization statistics
-            edge_norm_stats=edge_norm_stats,  # Store edge (2-point EEC) normalization statistics
-            hyperedge_norm_stats=hyperedge_norm_stats  # Store hyperedge (n-point EEC) normalization statistics
+            y=graph_label             # Graph label.
         )
 
 
@@ -863,11 +911,7 @@ def _construct_particle_graph_pyg(
             x=node_features, 
             edge_index=edge_indices_long, 
             edge_attr=None, 
-            y=graph_label,
-            particle_norm_stats=particle_norm_stats,  # Store particle normalization statistics
-            jet_norm_stats=jet_norm_stats,  # Store jet-level normalization statistics
-            edge_norm_stats=edge_norm_stats,  # Store edge normalization statistics
-            hyperedge_norm_stats=hyperedge_norm_stats  # Store hyperedge normalization statistics
+            y=graph_label
         )
 
     return graph

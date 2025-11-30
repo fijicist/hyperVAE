@@ -1,6 +1,6 @@
 # HyperVAE: Bipartite Hypergraph Variational Autoencoder for Jet Generation
 
-## 🎯 Project Overview
+## Project Overview
 
 **HyperVAE** is a physics-informed deep generative model for synthesizing particle physics jets using Variational Autoencoders (VAE) with Lorentz-equivariant transformations. The model generates jets as bipartite hypergraphs, preserving both the underlying physics symmetries and complex multi-particle correlations.
 
@@ -28,7 +28,7 @@ Traditional physics simulations (e.g., PYTHIA, GEANT) are:
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 ### 1. **Lorentz Equivariance (L-GATr)**
 
@@ -44,10 +44,12 @@ HyperVAE uses **L-GATr (Lorentz Group Attention)** to ensure generated jets resp
 
 Jets are represented as graphs with:
 - **Particles**: Primary objects (nodes)
-- **Edges**: Pairwise particle relationships (angular distance, kt, etc.)
+- **Edges**: Pairwise particle relationships with 2-point correlations (2-pt EEC, angular distance, etc.)
 - **Hyperedges**: Higher-order correlations (3-point, 4-point structures)
 
-**Benefit**: Captures complex jet substructure (W/Z boson decays, top quark signatures) beyond simple particle lists.
+Note: Edge and hyperedge features are pre-computed from the dataset during graph construction. The decoder generates only particles; edge/hyperedge observables are computed from particles for distribution matching during training.
+
+**Benefit**: Captures complex jet substructure while keeping generation tractable.
 
 ### 3. **Squared Distance Chamfer Loss**
 
@@ -69,21 +71,20 @@ Designed to run on **4GB VRAM** (e.g., GTX 1650 Ti):
 - Efficient PyG batch format
 - Optional gradient checkpointing
 
-**Benefit**: Train state-of-the-art models without expensive GPUs.
+**Benefit**: Train competitive models without expensive GPUs.
 
-### 5. **Multi-Task Learning**
+### 5. **Distribution Matching**
 
-Simultaneous learning of:
-- Particle 4-momenta (primary)
-- Edge features (auxiliary)
-- Hyperedge features (auxiliary)
-- Jet-level properties (soft constraint)
+Rather than directly generating edge/hyperedge features, the model:
+- Generates particles using L-GATr
+- Computes observables from particles during training
+- Matches distributions with pre-computed dataset features using Wasserstein distance
 
-**Benefit**: Richer representations, better generalization.
+**Benefit**: Simpler architecture, better particle quality, physics-consistent observables.
 
 ---
 
-## 📊 Model Architecture
+## Model Architecture
 
 ```
 Input Jets (PyG Data)
@@ -104,7 +105,6 @@ Input Jets (PyG Data)
 │  • Latent Expansion + Jet Type Conditioning│
 │  • Topology Decoder (Gumbel-Softmax)       │
 │  • L-GATr Particle Generation              │
-│  • Edge/Hyperedge MLPs                      │
 │  • Jet Feature Prediction                  │
 └─────────────────────────────────────────────┘
     ↓
@@ -115,7 +115,7 @@ Generated Jets
 
 ---
 
-## 🎓 Physics-Motivated Design
+## Physics-Motivated Design
 
 ### Lorentz Symmetry
 
@@ -153,7 +153,7 @@ Jet particle ordering is arbitrary (no physical meaning). HyperVAE uses:
 
 ---
 
-## 🛠️ Implementation Highlights
+## Implementation Highlights
 
 ### Training Strategies
 
@@ -166,18 +166,19 @@ Jet particle ordering is arbitrary (no physical meaning). HyperVAE uses:
 ### Loss Composition
 
 ```yaml
-Total Loss = 12000 × L_particle        # Chamfer distance (primary)
-           + 250 × L_edge              # Edge features (auxiliary)
-           + 150 × L_hyperedge         # Hyperedge features (auxiliary)
-           + 6000 × L_jet              # Jet features (constraint)
-           + β(epoch) × 0.3 × L_KL     # KL divergence (annealed)
+Total Loss = 12000 × L_particle           # Chamfer distance (primary)
+           + 1 × L_edge_distribution      # 2-pt EEC Wasserstein
+           + 1 × L_hyperedge_distribution # N-pt EEC Wasserstein
+           + 3000 × L_jet                 # Jet features (constraint)
+           + 3000 × L_consistency         # Local-global physics
+           + β(epoch) × 0.3 × L_KL        # KL divergence (annealed)
 ```
 
-**Design principle**: Primary loss dominates (particles), auxiliary losses provide weak guidance.
+**Design principle**: Primary loss dominates (particles), distribution losses provide weak statistical guidance.
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 hyperVAE/
@@ -205,7 +206,7 @@ hyperVAE/
 
 ---
 
-## 🔧 Data Preprocessing
+## Data Preprocessing
 
 Before training, jets must be converted to PyG graph format with `graph_constructor.py`:
 
@@ -366,17 +367,17 @@ Identify unusual jets:
 
 ---
 
-## 🎯 Technical Innovations
+## Technical Innovations
 
 1. **First application of L-GATr** (Lorentz Group Attention) to jet generation
 2. **Squared distance Chamfer loss** for stable gradient flow
 3. **Bipartite hypergraph** representation capturing higher-order correlations
 4. **Memory-optimized** for consumer-grade GPUs (4GB VRAM)
-5. **Multi-task learning** with auxiliary losses for graph structure
+5. **Distribution matching** using Wasserstein distance for graph observables
 
 ---
 
-## 📚 Documentation
+## Documentation
 
 - **[MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md)**: Comprehensive technical documentation
   - Encoder/decoder architecture
@@ -437,15 +438,15 @@ Special relativity is fundamental:
 
 ---
 
-## 🛣️ Roadmap
+## Roadmap
 
 ### Current Status
-- ✅ Core VAE architecture implemented
-- ✅ L-GATr integration for Lorentz equivariance
-- ✅ Squared distance Chamfer loss
-- ✅ Multi-task learning with auxiliary losses
-- ✅ Memory optimization (4GB VRAM)
-- ✅ Comprehensive documentation
+- Core VAE architecture implemented
+- L-GATr integration for Lorentz equivariance
+- Squared distance Chamfer loss
+- Distribution matching with Wasserstein distance
+- Memory optimization (4GB VRAM)
+- Comprehensive documentation
 
 ### Future Work
 - [ ] Larger-scale training (100k+ jets)

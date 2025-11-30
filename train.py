@@ -168,8 +168,8 @@ def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device)
     total_loss = 0.0
     losses_dict = {
         'particle': 0.0,
-        'edge': 0.0,
-        'hyperedge': 0.0,
+        'edge_distribution': 0.0,
+        'hyperedge_distribution': 0.0,
         'jet': 0.0,
         'kl': 0.0,
         'consistency': 0.0,
@@ -217,8 +217,8 @@ def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device)
                 return x
             
             print(f"  Particle loss: {get_value(losses['particle'])}")
-            print(f"  Edge loss: {get_value(losses['edge'])}")
-            print(f"  Hyperedge loss: {get_value(losses['hyperedge'])}")
+            print(f"  Edge distribution loss: {get_value(losses.get('edge_distribution', 0.0))}")
+            print(f"  Hyperedge distribution loss: {get_value(losses.get('hyperedge_distribution', 0.0))}")
             print(f"  Jet loss: {get_value(losses['jet'])}")
             print(f"  KL loss: {get_value(losses['kl'])}")
             
@@ -304,8 +304,8 @@ def validate(model, loader, config, epoch, writer, device):
     total_loss = 0.0
     losses_dict = {
         'particle': 0.0,
-        'edge': 0.0,
-        'hyperedge': 0.0,
+        'edge_distribution': 0.0,
+        'hyperedge_distribution': 0.0,
         'jet': 0.0,
         'kl': 0.0,
         'consistency': 0.0
@@ -532,16 +532,16 @@ def main(args):
             
             # Print training losses
             print(f"  Train - Part: {losses_dict['particle']:.4f}, "
-                  f"Edge: {losses_dict['edge']:.4f}, "
-                  f"Hyper: {losses_dict['hyperedge']:.4f}, "
+                  f"Edge Dist: {losses_dict['edge_distribution']:.4f}, "
+                  f"Hyper Dist: {losses_dict['hyperedge_distribution']:.4f}, "
                   f"Jet: {losses_dict['jet']:.4f}, "
                   f"Cons: {losses_dict['consistency']:.4f}, "
-                  f"KL: {losses_dict['kl']:.4f} (w={losses_dict['kl_weight']:.4f})")
+                  f"KL: {losses_dict['kl']:.4f} (w={losses_dict.get('kl_weight', 0.0):.4f})")
             
             # Print validation losses
             print(f"  Val   - Part: {val_losses_dict['particle']:.4f}, "
-                  f"Edge: {val_losses_dict['edge']:.4f}, "
-                  f"Hyper: {val_losses_dict['hyperedge']:.4f}, "
+                  f"Edge Dist: {val_losses_dict['edge_distribution']:.4f}, "
+                  f"Hyper Dist: {val_losses_dict['hyperedge_distribution']:.4f}, "
                   f"Jet: {val_losses_dict['jet']:.4f}, "
                   f"Cons: {val_losses_dict['consistency']:.4f}, "
                   f"KL: {val_losses_dict['kl']:.4f}")

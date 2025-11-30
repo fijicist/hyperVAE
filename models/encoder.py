@@ -1,9 +1,9 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
-ENCODER - BIPARTITE HYPERGRAPH TO VAE LATENT SPACE
+ENCODER - PARTICLE JET TO VAE LATENT SPACE
 ═══════════════════════════════════════════════════════════════════════════════
 
-Encodes jets (represented as bipartite hypergraphs) into VAE latent space.
+Encodes particle jets into VAE latent space using graph structure information.
 
 Architecture:
 -------------
@@ -11,7 +11,7 @@ Architecture:
     Edges [M, 5] → MLP → [M, edge_hidden]
     Hyperedges [K, features] → MLP → [K, hyperedge_hidden]
                     ↓
-              Cross-Attention (particles ↔ hyperedges)
+              Cross-Attention (particles ↔ edges/hyperedges)
                     ↓
             Global Pooling (mean over particles/edges/hyperedges)
                     ↓
@@ -20,17 +20,23 @@ Architecture:
 Key Components:
 ---------------
 1. L-GATr Particle Encoder: Lorentz-equivariant processing of 4-momenta
-2. Edge/Hyperedge MLPs: Process graph structure information
-3. Cross-Attention: Fuses particle-level and hyperedge-level information
+2. Edge/Hyperedge MLPs: Process pre-computed graph observables from dataset
+3. Cross-Attention: Fuses particle-level and graph-level information
 4. Global Pooling: Aggregates variable-length inputs to fixed-size latent
 5. Latent Projection: Maps to VAE latent space (μ, logvar for reparameterization)
+
+Input Features (from dataset):
+-------------------------------
+- Particles: [E, px, py, pz] - 4-momenta
+- Edges: [2pt_EEC, ln_delta, ln_kT, ln_z, ln_m2] - pairwise observables
+- Hyperedges: [3pt_EEC, 4pt_EEC, ...] - multi-particle correlations
 
 Outputs:
 --------
 mu: [batch_size, latent_dim] - Mean of latent distribution
 logvar: [batch_size, latent_dim] - Log-variance of latent distribution
 
-These are used for VAE reparameterization: z = μ + σ * ε, where ε ~ N(0, I)
+Used for VAE reparameterization: z = μ + σ * ε, where ε ~ N(0, I)
 """
 import torch
 import torch.nn as nn
@@ -40,13 +46,19 @@ from .lgatr_wrapper import LGATrParticleEncoder
 
 class BipartiteEncoder(nn.Module):
     """
-    Encoder for bipartite hypergraph VAE.
+    Encoder for particle jet VAE.
+    
+    Processes particles and graph structure (edges/hyperedges) to produce
+    latent distribution parameters (μ, σ²).
     
     Architecture:
-    1. Particle embedding (configurable dims) -> L-GATr blocks
-    2. Edge embedding (configurable dims) -> Edge-aware transformer
-    3. Hyperedge embedding (configurable dims) -> MLP blocks
-    4. Bipartite cross-attention -> Fusion MLP -> Latent (μ, σ²)
+    1. Particle embedding → L-GATr blocks
+    2. Edge embedding → MLP (processes pre-computed edge observables)
+    3. Hyperedge embedding → MLP (processes pre-computed N-pt correlations)
+    4. Cross-attention → Fusion → Latent (μ, log σ²)
+    
+    Note: Edge/hyperedge features are pre-computed observables from dataset,
+          not generated - they provide graph structure information to encoder.
     """
     
     def __init__(self, config):
@@ -144,11 +156,20 @@ class BipartiteEncoder(nn.Module):
         
         # 5. Bipartite cross-attention (use particle_output_dim instead of particle_hidden)
         num_heads = config.get('attention_heads', 4)  # Keep for backward compatibility
-        self.cross_attention = BipartiteCrossAttention(
+        self.particle_hyper_cross = BipartiteCrossAttention(
             particle_output_dim, hyperedge_hidden, num_heads, dropout
         )
+        self.particle_edge_cross = BipartiteCrossAttention(
+            particle_output_dim, edge_hidden, num_heads, dropout
+        )
         
-        # 6. Fusion and latent projection with pre-projection for residual
+        # 6. LayerNorm after pooling for each branch
+        self.particle_pool_norm = nn.LayerNorm(particle_output_dim)
+        self.edge_pool_norm = nn.LayerNorm(edge_hidden)
+        self.hyperedge_pool_norm = nn.LayerNorm(hyperedge_hidden)
+        self.jet_pool_norm = nn.LayerNorm(jet_hidden)
+        
+        # 7. Fusion and latent projection with pre-projection for residual
         fusion_dim = particle_output_dim + hyperedge_hidden + edge_hidden + jet_hidden
         
         # Project fused features to latent_dim*2 for residual connection
@@ -284,15 +305,27 @@ class BipartiteEncoder(nn.Module):
             # Residual connection
             jet_x = jet_x + layer(jet_x)
         
-        # 5. Cross-attention between particles and hyperedges
-        cross_features = self.cross_attention(particle_pooled, hyperedge_pooled)
+        # 5. Apply LayerNorm after pooling for each branch
+        particle_pooled = self.particle_pool_norm(particle_pooled)
+        edge_pooled = self.edge_pool_norm(edge_pooled)
+        hyperedge_pooled = self.hyperedge_pool_norm(hyperedge_pooled)
+        jet_pooled = self.jet_pool_norm(jet_x)
         
-        # 6. Fusion with residual connection (now includes jet features)
-        fused = torch.cat([particle_pooled, hyperedge_pooled, edge_pooled, jet_x], dim=-1)
+        # 6. Cross-attention at pool level to refine particle_pooled
+        # Cross-attend particles to hyperedges (residual)
+        hyper_attn = self.particle_hyper_cross(particle_pooled, hyperedge_pooled)
+        particle_pooled = particle_pooled + hyper_attn
+        
+        # Cross-attend particles to edges (residual)
+        edge_attn = self.particle_edge_cross(particle_pooled, edge_pooled)
+        particle_pooled = particle_pooled + edge_attn
+        
+        # 7. Fusion with residual connection (now includes jet features)
+        fused = torch.cat([particle_pooled, edge_pooled, hyperedge_pooled, jet_pooled], dim=-1)
         fused_proj = self.fusion_pre_proj(fused)  # Project to latent_dim*2
         fused = fused_proj + self.fusion_mlp(fused_proj)  # Residual: preserve direct mapping
         
-        # 6. Latent parameters with normalization for stability
+        # 8. Latent parameters with normalization for stability
         fused = self.latent_norm(fused)  # Normalize before projection to prevent explosion
         mu = self.mu_proj(fused)
         logvar = self.logvar_proj(fused)

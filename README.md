@@ -6,7 +6,7 @@ Designed for **consumer-grade GPUs (4GB VRAM)**, HyperVAE employs memory-optimiz
 
 ---
 
-## 🏗️ Model Architecture
+## Model Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -80,16 +80,6 @@ Designed for **consumer-grade GPUs (4GB VRAM)**, HyperVAE employs memory-optimiz
          │  │   └────────────────────────┘            │     │
          │  │                                         │     │
          │  │   ┌────────────────────────┐            │     │
-         │  │   │ Edge Decoder (MLP)     │            │     │
-         │  │   │ → 2pt-EEC + features   │            │     │
-         │  │   └────────────────────────┘            │     │
-         │  │                                         │     │
-         │  │   ┌────────────────────────┐            │     │
-         │  │   │ Hyperedge Decoder (MLP)│            │     │
-         │  │   │ → Npt-EEC features     │            │     │
-         │  │   └────────────────────────┘            │     │
-         │  │                                         │     │
-         │  │   ┌────────────────────────┐            │     │
          │  │   │ Jet Feature Head       │            │     │
          │  │   │ → [pt, eta, mass]      │            │     │
          │  │   └────────────────────────┘            │     │
@@ -101,21 +91,22 @@ Designed for **consumer-grade GPUs (4GB VRAM)**, HyperVAE employs memory-optimiz
                 │   LOSS COMPUTATION             │
                 │                                │
                 │  • Chamfer Distance (particles)│
-                │  • MSE (edges, hyperedges)     │
+                │  • Distribution Loss (EEC)     │
                 │  • Jet Feature Loss            │
+                │  • Consistency Loss            │
                 │  • KL Divergence (annealed)    │
                 └────────────────────────────────┘
 ```
 
 **Key Components:**
 - **L-GATr Layers**: Ensure Lorentz equivariance (boosts, rotations)
-- **Bipartite Structure**: Particles + Edges + Hyperedges
+- **Bipartite Structure**: Particles + pre-computed edge/hyperedge observables for encoding
 - **Gumbel-Softmax**: Differentiable topology learning
-- **Multi-Task Learning**: Particles (primary) + Auxiliary features
+- **Distribution Matching**: Generated particles compared with dataset EEC distributions
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - **Python**: 3.8+ (3.10 recommended)
@@ -134,12 +125,12 @@ bash setup.sh
 ```
 
 The setup script will:
-- ✅ Auto-detect your Python version and CUDA version
-- ✅ Install PyTorch with correct CUDA support (or CPU-only)
-- ✅ Install PyTorch Geometric with matching wheels
-- ✅ Install L-GATr, FastJet, and physics libraries
-- ✅ Verify all dependencies
-- ✅ Run a quickstart test
+- Auto-detect your Python version and CUDA version
+- Install PyTorch with correct CUDA support (or CPU-only)
+- Install PyTorch Geometric with matching wheels
+- Install L-GATr, FastJet, and physics libraries
+- Verify all dependencies
+- Run a quickstart test
 
 **Manual installation** (if setup.sh fails):
 ```bash
@@ -245,9 +236,10 @@ training:
   
 loss_weights:
   particle: 12000.0         # Primary loss
-  edge: 250.0               # Auxiliary
-  hyperedge: 150.0          # Auxiliary
-  jet_features: 6000.0      # Soft constraint
+  edge_distribution: 1.0    # 2-pt EEC Wasserstein
+  hyperedge_distribution: 1.0  # N-pt EEC Wasserstein
+  jet_features: 3000.0      # Soft constraint
+  consistency: 3000.0       # Local-global physics
   kl_weight: 0.3            # Annealed during training
 ```
 
@@ -350,7 +342,7 @@ evaluation_results/
 └── metrics.json
 ```
 
-## 🔧 Advanced Usage
+## Advanced Usage
 
 ### Resume Training from Checkpoint
 
@@ -384,7 +376,7 @@ To use your own jet data:
 
 ---
 
-## 📚 Documentation
+## Documentation
 
 - **[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)**: High-level overview, physics motivation, architecture
 - **[MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md)**: Detailed technical documentation
@@ -393,7 +385,7 @@ To use your own jet data:
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Out of Memory (OOM)
 
@@ -414,12 +406,12 @@ bash setup.sh  # Auto-detects CUDA version
 
 ### Slow Training
 
-- ✅ Enable mixed precision: `mixed_precision: true` in config
-- ✅ Use BF16 on Ampere+ GPUs: `precision_type: "bf16"` (RTX 30xx/40xx, A100)
-- ✅ Use FP16 on Volta/Turing GPUs: `precision_type: "fp16"` (V100, T4, RTX 20xx)
-- ✅ Increase batch size if you have more VRAM
-- ✅ Use gradient checkpointing: `gradient_checkpointing: true`
-- ✅ Check GPU utilization: `nvidia-smi -l 1`
+- Enable mixed precision: `mixed_precision: true` in config
+- Use BF16 on Ampere+ GPUs: `precision_type: "bf16"` (RTX 30xx/40xx, A100)
+- Use FP16 on Volta/Turing GPUs: `precision_type: "fp16"` (V100, T4, RTX 20xx)
+- Increase batch size if you have more VRAM
+- Use gradient checkpointing: `gradient_checkpointing: true`
+- Check GPU utilization: `nvidia-smi -l 1`
 
 **Mixed Precision Guide:**
 - **BF16 (bfloat16)**: Better numerical stability, wider dynamic range. Recommended for Ampere+ (SM 8.0+)
@@ -428,30 +420,14 @@ bash setup.sh  # Auto-detects CUDA version
 
 ### Poor Generation Quality
 
-- ⚠️ Train longer (model may need 300+ epochs to converge)
-- ⚠️ Check loss curves for plateaus or divergence
-- ⚠️ Increase KL annealing warmup epochs for smoother training
-- ⚠️ Verify data normalization statistics are computed correctly
-- ⚠️ Consider adjusting loss weights if one component dominates
+- Train longer (model may need 300+ epochs to converge)
+- Check loss curves for plateaus or divergence
+- Increase KL annealing warmup epochs for smoother training
+- Verify data normalization statistics are computed correctly
+- Consider adjusting loss weights if one component dominates
 
-**Note**: Achieving high-quality jet generation is challenging and may require hyperparameter tuning and multiple training runs.
 
----
-
-## 📝 Citation
-
-If you use HyperVAE in your research, please cite:
-
-```bibtex
-@software{hypervae2024,
-  author = {Your Name},
-  title = {HyperVAE: Lorentz-Equivariant Hypergraph VAE for Jet Generation},
-  year = {2024},
-  url = {https://github.com/fijicist/hyperVAE}
-}
-```
-
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **L-GATr**: [Brehmer et al., "Geometric Algebra Transformers"](https://arxiv.org/abs/2305.18415)
 - **JetNet**: [Kansal et al., "JetNet Dataset"](https://arxiv.org/abs/2106.11535)
