@@ -181,8 +181,6 @@ def generate_jets(model, num_samples, batch_size, jet_type_dist, device, tempera
                 z, 
                 jet_type_tensor, 
                 temperature=temperature,
-                generate_edges=False,        # ✅ Don't generate edges
-                generate_hyperedges=False    # ✅ Don't generate hyperedges
             )
             
             # Extract particle features and jet features

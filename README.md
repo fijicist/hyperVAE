@@ -2,7 +2,7 @@
 
 **HyperVAE** is a physics-informed deep generative model for synthesizing high-energy physics jets using Variational Autoencoders with Lorentz-equivariant transformations. The model represents jets as bipartite hypergraphs with particle nodes, pairwise edges encoding 2-point Energy-Energy Correlators (EEC), and hyperedges capturing higher-order N-point correlations. By leveraging L-GATr (Lorentz Group Attention) layers, HyperVAE aims to generate jets that respect special relativity and fundamental spacetime symmetries.
 
-Designed for **consumer-grade GPUs (4GB VRAM)**, HyperVAE employs memory-optimized training strategies including gradient accumulation, mixed-precision computation, and efficient PyG batching. Deep generative models offer the potential for significantly faster jet generation compared to traditional physics simulators, which could be useful for data augmentation, detector studies, and physics analyses.
+Designed for consumer-grade GPUs, HyperVAE employs memory-optimized training strategies including gradient accumulation, mixed-precision computation. Deep generative models offer the potential for significantly faster jet generation compared to traditional physics simulators, which could be useful for data augmentation, detector studies, and physics analyses.
 
 ---
 
@@ -215,7 +215,7 @@ Start training with default configuration:
 ```bash
 python train.py \
     --config config.yaml \
-    --data-path data/real/graphs_pyg_particle__fully_connected_final.pt \
+    --data-path data/real/real_jets.pt \
     --save-dir checkpoints \
     --log-dir runs
 ```
@@ -267,8 +267,7 @@ Visit `http://localhost:6006` to see:
 - Gradient norms
 
 **Expected training time:**
-- **GTX 1650 Ti (4GB)**: ~12 hours for 300 epochs (18k jets)
-- **RTX 3090 (24GB)**: ~3 hours
+- **GTX 1650 Ti (4GB)**: ~12 hours for 100 epochs (20k jets)
 
 **Note**: Training time varies based on hardware and dataset size. The model is designed to be trainable on consumer hardware, though performance may vary.
 
@@ -284,28 +283,31 @@ Sample new jets from trained model:
 
 ```bash
 python generate.py \
-    --checkpoint checkpoints/best_model.pt \
-    --output generated_jets.pt \
+    --checkpoint checkpoints//best_model.pt \
+    --output data/generated/generated_jets.pt \
     --num-samples 10000 \
-    --jet-type q \
+    --batch-size 32 \
+    --quark-frac 0.3333 \
     --gpu
 ```
 
 **Options:**
 - `--num-samples`: Number of jets to generate
 - `--jet-type`: `q` (quark), `g` (gluon), `t` (top), or `None` (sample from prior)
-- `--temperature`: Sampling temperature (default: 1.0, lower = more conservative)
+- `--temperature`: Sampling temperature (default: final_temperature of gumbel-softmax, lower = more conservative)
 - `--batch-size`: Generation batch size (default: 256)
 
 **Output format:**
 ```python
-# List of PyG Data objects
+# List of PyG Data objects (list)
 [
-    Data(x=[N₁, 4], edge_attr=[M₁, 5], y=[4]),
-    Data(x=[N₂, 4], edge_attr=[M₂, 5], y=[4]),
+    Data(x=[N₁, 4], y=[4]),  # x: particles [E,px,py,pz], y: [type,pt,eta,mass]
+    Data(x=[N₂, 4], y=[4]),
     ...
 ]
 ```
+
+**Note**: Generated jets contain only particles (`x`) and jet labels (`y`). No edge features since the decoder generates particles only.
 
 **Denormalization** happens automatically using stored `*_norm_stats` from training data.
 
@@ -317,30 +319,58 @@ Compare generated jets to real data:
 
 ```bash
 python evaluate.py \
-    --real-data data/real/graphs_pyg_particle__fully_connected_final.pt \
-    --generated-data generated_jets.pt \
-    --output-dir evaluation_results
+    --real-data data/real/real_jets.pt \
+    --generated-data data/generated/generated_jets.pt \
+    --max-jets 10000 \
+    --plot \
+    --plot-dir plots/
 ```
 
 **Metrics computed:**
-- **Particle-level**: Multiplicity, pT, η, φ distributions
-- **Jet-level**: Mass, pT, η distributions
-- **Physics observables**: 
-  - Energy-Energy Correlators (EEC)
-  - N-subjettiness ratios
-  - Jet mass, jet width
-- **Statistical comparisons**: Distribution overlaps and Wasserstein distances
 
-**Note**: Evaluation metrics are being developed and validated. Physics fidelity assessment is an ongoing area of research.
+**Wasserstein Distances** (measures distribution similarity, lower = better):
+- **Particle features**: E, px, py, pz distributions
+- **Jet features**: pt, η, mass distributions
+- **Structural**: Number of particles per jet
 
-**Output:**
+**Structural Metrics**:
+- Mean/std particle multiplicity (real vs generated)
+- Jet type distribution (quark/gluon/top fractions)
+
+**Example output:**
 ```
-evaluation_results/
-├── particle_distributions.png
-├── jet_distributions.png
-├── eec_comparison.png
-└── metrics.json
+Wasserstein Distances:
+  Particle Features:
+    particle_E          : 0.347934
+    particle_px         : 0.320851
+    particle_py         : 0.422025
+    particle_pz         : 0.137377
+
+  Jet Features:
+    jet_pt              : 0.571115
+    jet_eta             : 0.127950
+    jet_mass            : 0.064019
+
+  n_particles         : 4.485000
+
+Structural Metrics:
+  Mean particles (real): 29.15
+  Mean particles (gen):  33.63
+  
+  Jet Type Distribution:
+    Quark  - Real: 0.342, Gen: 0.333
+    Gluon  - Real: 0.328, Gen: 0.332
+    Top    - Real: 0.331, Gen: 0.335
 ```
+
+**Plot outputs** (if `--plot` flag used):
+```
+plots/
+├── particle_features.png      # E, px, py, pz histograms
+├── jet_features.png           # pt, η, mass, n_particles histograms
+```
+
+**Note**: Generated jets typically have only particle and jet features (no edges/hyperedges since decoder generates particles and jet features only).
 
 ## Advanced Usage
 
@@ -410,7 +440,6 @@ bash setup.sh  # Auto-detects CUDA version
 - Use BF16 on Ampere+ GPUs: `precision_type: "bf16"` (RTX 30xx/40xx, A100)
 - Use FP16 on Volta/Turing GPUs: `precision_type: "fp16"` (V100, T4, RTX 20xx)
 - Increase batch size if you have more VRAM
-- Use gradient checkpointing: `gradient_checkpointing: true`
 - Check GPU utilization: `nvidia-smi -l 1`
 
 **Mixed Precision Guide:**

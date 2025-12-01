@@ -10,7 +10,14 @@ def load_jets_from_pt(file_path, max_jets=None):
     """Load jet data from .pt file (PyG Data format)"""
     print(f"Loading jets from {file_path}...")
     
-    data_list = torch.load(file_path, weights_only=False)
+    loaded_data = torch.load(file_path, weights_only=False)
+    
+    # Handle both old format (list) and new format (dict with 'graphs' key)
+    if isinstance(loaded_data, dict) and 'graphs' in loaded_data:
+        data_list = loaded_data['graphs']
+    else:
+        data_list = loaded_data
+    
     n_jets = len(data_list) if max_jets is None else min(max_jets, len(data_list))
     
     particle_features = []

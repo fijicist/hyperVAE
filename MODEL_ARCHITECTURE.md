@@ -114,13 +114,16 @@ model:
   hyperedge_hidden: 64        # Hyperedge MLP hidden dim
   jet_hidden: 128             # Jet-level MLP hidden dim
   latent_dim: 32              # Latent space dimension
-  attention_heads: 4          # Multi-head attention
   max_particles: 60           # Maximum particles per jet
   
   particle_features: 4        # [E, px, py, pz]
   edge_features: 5            # 5 pairwise features
   hyperedge_features: 1       # EEC values
   jet_features: 3             # [jet_pt, jet_eta, jet_mass]
+  
+  encoder:
+    cross_attention_heads: 4  # Heads for particle↔edge/hyperedge cross-attention
+    # ... (see config.yaml for full encoder config)
 ```
 
 **Design Rationale**:
@@ -1004,7 +1007,6 @@ model:
   hyperedge_hidden: 64        # Hyperedge MLP hidden dim
   jet_hidden: 128             # Jet MLP hidden dim
   latent_dim: 32              # Latent space dimension
-  attention_heads: 4          # Multi-head attention
   max_particles: 60           # Maximum particles per jet
   
   # Feature dimensions

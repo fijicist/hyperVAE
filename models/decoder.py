@@ -746,7 +746,6 @@ if __name__ == "__main__":
         'edge_hidden': 48,
         'hyperedge_hidden': 32,
         'max_particles': 150,
-        'attention_heads': 4,
         'decoder': {
             'mlp_layers': 3,
             'dropout': 0.1,

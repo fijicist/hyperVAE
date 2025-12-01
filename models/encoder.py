@@ -155,7 +155,8 @@ class BipartiteEncoder(nn.Module):
         ])
         
         # 5. Bipartite cross-attention (use particle_output_dim instead of particle_hidden)
-        num_heads = config.get('attention_heads', 4)  # Keep for backward compatibility
+        # Get cross-attention heads from encoder config (backward compatible with old 'attention_heads')
+        num_heads = config['encoder'].get('cross_attention_heads', config.get('attention_heads', 4))
         self.particle_hyper_cross = BipartiteCrossAttention(
             particle_output_dim, hyperedge_hidden, num_heads, dropout
         )
@@ -418,8 +419,8 @@ if __name__ == "__main__":
         'edge_hidden': 48,
         'hyperedge_hidden': 32,
         'latent_dim': 128,
-        'attention_heads': 4,
         'encoder': {
+            'cross_attention_heads': 4,  # For bipartite cross-attention
             'particle_lgat_layers': 3,
             'edge_transformer_layers': 2,
             'hyperedge_lgat_layers': 2,
