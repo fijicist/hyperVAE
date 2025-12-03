@@ -1,8 +1,8 @@
 model:
   # Hidden dimensions 
-  particle_hidden: 96        
-  edge_hidden: 64             
-  hyperedge_hidden: 32        
+  particle_hidden: 128        
+  edge_hidden: 96             
+  hyperedge_hidden: 64        
   jet_hidden: 96             
   latent_dim: 32    # Has to match the scalar channels of LGATr latent projection          
   max_particles: 60
@@ -86,7 +86,7 @@ model:
       hidden_s_channels: 32     # Hidden scalar channels (match encoder)
       
       # === TRANSFORMER ARCHITECTURE ===
-      num_blocks: 3             # Number of L-GATr transformer blocks (match encoder)
+      num_blocks: 4             # Number of L-GATr transformer blocks (match encoder)
       
       # Attention Configuration
       attention:
@@ -119,32 +119,32 @@ model:
     # training.final_temperature, and training.temperature_decay settings below
 
 training:
-  batch_size: 64                  # Effective batch = 64 * 4 = 256
-  gradient_accumulation_steps: 4  # Good for memory constraints
+  batch_size: 32                  # Effective batch = 64 * 4 = 256
+  gradient_accumulation_steps: 8  # Good for memory constraints
   epochs: 200
-  learning_rate: 0.0001           # Finer updates for stability
-  weight_decay: 0.001             # Keep: L2 regularization
-  latent_noise: 0.01              # Keep: noise for regularization
+  learning_rate: 0.0003           # Finer updates for stability
+  weight_decay: 0.005             # Keep: L2 regularization
+  latent_noise: 0.05              # Keep: noise for regularization
   mixed_precision: true           # Enable mixed precision training (FP16/BF16)
   precision_type: "fp16"          # Precision type: "fp16" (Volta+/Turing+) or "bf16" (Ampere+, better stability)
   
   # Gradient clipping (increased for squared distance metric)
   # Squared distance has linear gradients (∂d²/∂x = 2x) which are more stable than
   # Euclidean gradients (∂√d²/∂x = x/d) that can spike for small errors
-  gradient_clip: 10.0
+  gradient_clip: 15.0
   
   # Scheduler
   scheduler: "cosine"
-  warmup_epochs: 10
-  min_lr: 0.00001
+  warmup_epochs: 20
+  min_lr: 0.00003
   
   # Loss weights for different components
   loss_weights:
-    particle_features: 10000.0       # REDUCED from 12000 - slightly less dominant
-    jet_features: 5000.0             # Jet-level feature loss (jet_pt, jet_eta, jet_mass)
-    edge_distribution: 300.0         # INCREASED from 10 - 10x boost for EEC learning
-    hyperedge_distribution: 100.0    # INCREASED from 10 - 10x boost for N-point EEC
-    local_global_consistency: 100.0  # INCREASED from 5 - 20x boost for physics consistency
+    particle_features: 12000.0       # REDUCED from 12000 - slightly less dominant
+    jet_features: 3000.0             # Jet-level feature loss (jet_pt, jet_eta, jet_mass)
+    edge_distribution: 500.0         # INCREASED from 10 - 10x boost for EEC learning
+    hyperedge_distribution: 400.0    # INCREASED from 10 - 10x boost for N-point EEC
+    local_global_consistency: 400.0  # INCREASED from 5 - 20x boost for physics consistency
     kl_divergence: 1.0               # INCREASED from 0.3 - stronger regularization base
   
   # Loss function configuration
@@ -167,13 +167,13 @@ training:
     # Hyperbolic Chamfer distance configuration
     # Uses hyperbolic geometry transformation: d_hyp = arcosh(1 + α × d_E²)
     # Paper: arXiv:2412.17951 shows hyperbolic Chamfer better captures jet structure
-    hyperbolic_alpha: 1.0        # Hyperparameter controlling hyperbolic curvature
+    hyperbolic_alpha: 0.5        # Hyperparameter controlling hyperbolic curvature
                                  # α → 0: recovers standard Chamfer
                                  # α > 0: stronger hyperbolic effect, emphasizes large distances
     
     # pT-weighted Chamfer loss
-    use_pt_weighting: true      # Enable pT-based weighting of Chamfer distance
-    pt_weight_alpha: 1.0        # Exponent for pT weighting: α=1.0 (linear), α=2.0 (quadratic)
+    use_pt_weighting: false      # Enable pT-based weighting of Chamfer distance
+    pt_weight_alpha: 0.5        # Exponent for pT weighting: α=1.0 (linear), α=2.0 (quadratic)
     
     evaluation_metric: "hyperbolic_chamfer"  # Use chamfer for validation too (was "wasserstein" with wrong scale)
     
@@ -183,8 +183,8 @@ training:
     jet_mass_index: 3           # Index of jet_mass in y tensor
     
     # Jet features loss weights (individual MSE components)
-    jet_pt_weight: 2.5          # Weight for MSE(jet_pt)
-    jet_eta_weight: 1.0         # Weight for MSE(jet_eta)
+    jet_pt_weight: 3.0          # Weight for MSE(jet_pt)
+    jet_eta_weight: 0.5         # Weight for MSE(jet_eta)
     jet_mass_weight: 5.0        # Weight for MSE(jet_mass)
     jet_n_constituents_weight: 0.0  # DISABLE: MSE on integer counts has wrong scale (400 >> 1)
     
@@ -192,12 +192,14 @@ training:
     # Enforces agreement between generated particle 4-momenta and true jet-level features
     # Computes jet observables (pT, η, m) from particles and compares to true jet values
     use_consistency_loss: true  # Enable local→global consistency loss
-    consistency_pt_weight: 2.5  # Weight for pT residual (most important, affects trigger/selection)
-    consistency_eta_weight: 1.0  # Weight for η residual (detector geometry, less critical)
+    consistency_pt_weight: 3.0  # Weight for pT residual (most important, affects trigger/selection)
+    consistency_eta_weight: 0.5  # Weight for η residual (detector geometry, less critical)
     consistency_mass_weight: 5.0  # Weight for mass residual (physics discriminant, e.g., top/W/Z tagging)
     
-    # Distribution Loss: Wasserstein distance between edge/hyperedge observables
+    # Distribution Loss: Match edge/hyperedge observable distributions
     use_distribution_loss: true      # Enable distribution matching loss
+    distribution_loss_type: "mse"    # Options: "wasserstein" (expensive, CPU), "mse" (fast, GPU)
+                                     # Wasserstein: Earth mover's distance (accurate but slow)
     eec_prop: [[2, 3], 200, [1e-4, 2]]  # [[N-point orders], bins, [axis_min, axis_max]]
   
   # KL annealing - Cyclical schedule to prevent posterior collapse and KL explosion
@@ -205,7 +207,7 @@ training:
   kl_warmup_epochs: 15          # INCREASED from 8 - slower warmup
   kl_cycle_epochs: 40           # INCREASED from 25 - longer cycles
   kl_free_bits: 2.0             # INCREASED from 1.5 - more tolerance per dimension
-  kl_max_weight: 0.5            # INCREASED from 0.12 - stronger max regularization
+  kl_max_weight: 0.55            # INCREASED from 0.12 - stronger max regularization
                                 # Effective max KL weight = 1.0 * 0.5 = 0.5
                                 # This should control KL explosion better
 
@@ -213,9 +215,9 @@ training:
   # Controls the sharpness of discrete topology sampling (particle/edge/hyperedge existence)
   # Higher temp → softer/more random, Lower temp → sharper/more deterministic
   # Annealing schedule: temp(epoch) = final_temp + (initial_temp - final_temp) × decay^epoch
-  initial_temperature: 5.0       # Start with very soft sampling (explore topology space)
-  final_temperature: 0.5         # End with sharp sampling (confident discrete choices)
-  temperature_decay: 0.99        # SLOWER from 0.98 - more gradual annealing for stability
+  initial_temperature: 10.0       # Start with very soft sampling (explore topology space)
+  final_temperature: 0.75         # End with sharp sampling (confident discrete choices)
+  temperature_decay: 0.98        # SLOWER from 0.98 - more gradual annealing for stability
   
   # Checkpointing
   save_every: 10

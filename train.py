@@ -165,16 +165,22 @@ from models.hypervae import BipartiteHyperVAE
 def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device):
     """Train for one epoch"""
     model.train()
-    total_loss = 0.0
+    
+    # Initialize loss accumulators as tensors on GPU 
+    total_loss = torch.tensor(0.0, device=device)
     losses_dict = {
-        'particle': 0.0,
-        'edge_distribution': 0.0,
-        'hyperedge_distribution': 0.0,
-        'jet': 0.0,
-        'kl': 0.0,
-        'consistency': 0.0,
-        'kl_weight': 0.0
+        'particle': torch.tensor(0.0, device=device),
+        'edge_distribution': torch.tensor(0.0, device=device),
+        'hyperedge_distribution': torch.tensor(0.0, device=device),
+        'jet': torch.tensor(0.0, device=device),
+        'kl': torch.tensor(0.0, device=device),
+        'consistency': torch.tensor(0.0, device=device),
+        'kl_weight': 0.0  # Keep as float, not a loss
     }
+    
+    # Track gradient norms
+    grad_norms = []
+    clip_count = 0  # Count how many times gradients were clipped
     
     # Gradient accumulation
     accumulation_steps = config['training']['gradient_accumulation_steps']
@@ -242,60 +248,100 @@ def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device)
             # Gradient clipping
             scaler.unscale_(optimizer)
             
-            # Check gradient norm before clipping
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
+            # Compute gradient norm before clipping (OPTIMIZED - avoid multiple .item() calls)
+            # Stack all gradient norms into a single tensor, then compute on GPU
+            grad_norms_tensor = torch.stack([
+                p.grad.data.norm(2) 
+                for p in model.parameters() 
+                if p.grad is not None
+            ])
+            total_norm = torch.norm(grad_norms_tensor, 2).item()  # Single GPU→CPU sync
+            
+            # Track gradient norm
+            grad_norms.append(total_norm)
+            
+            # Check if clipping will occur
+            gradient_clip_threshold = config['training']['gradient_clip']
+            if total_norm > gradient_clip_threshold:
+                clip_count += 1
             
             # Gradient Clipping
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), 
-                config['training']['gradient_clip']
+                gradient_clip_threshold
             )
             
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
         
-        # Logging
-        total_loss += losses['total'].item() if isinstance(losses['total'], torch.Tensor) else losses['total']
+        # Logging - accumulate on GPU to avoid sync (OPTIMIZED)
+        # Only convert to CPU once at the end of epoch
+        if isinstance(losses['total'], torch.Tensor):
+            total_loss += losses['total'].detach()
+        else:
+            total_loss += losses['total']
+            
         for key in losses_dict.keys():
-            if key in losses:
+            if key in losses and key != 'kl_weight':
                 if isinstance(losses[key], torch.Tensor):
-                    losses_dict[key] += losses[key].item()
+                    losses_dict[key] += losses[key].detach()
                 else:
                     losses_dict[key] += losses[key]
         
-        # Helper function to safely get scalar value
-        def get_scalar(x):
-            return x.item() if isinstance(x, torch.Tensor) else x
+        # Update kl_weight separately (it's a scalar, not accumulated)
+        if 'kl_weight' in losses:
+            losses_dict['kl_weight'] = losses['kl_weight']
         
-        pbar.set_postfix({
-            'loss': get_scalar(losses['total']),
-            'part': get_scalar(losses['particle']),
-            'kl': get_scalar(losses['kl']),
-            'kl_w': losses.get('kl_weight', 0.0)
-        })
+        # Update progress bar less frequently to avoid GPU→CPU sync overhead
+        # Only update every 10 batches instead of every batch
+        if i % 10 == 0:  # Update every 10 batches instead of every batch
+            # Helper function to safely get scalar value
+            def get_scalar(x):
+                return x.item() if isinstance(x, torch.Tensor) else x
+            
+            pbar.set_postfix({
+                'loss': get_scalar(losses['total']),
+                'part': get_scalar(losses['particle']),
+                'kl': get_scalar(losses['kl']),
+                'kl_w': losses.get('kl_weight', 0.0)
+            })
     
-    # Average losses
+    # Average losses - convert to CPU only once at the end
     n_batches = len(loader)
-    total_loss /= n_batches
+    total_loss = (total_loss / n_batches).item()  # Single GPU→CPU transfer
     for key in losses_dict.keys():
-        losses_dict[key] /= n_batches
+        if key != 'kl_weight':
+            losses_dict[key] = (losses_dict[key] / n_batches).item()  # Single transfer per loss
+    
+    # Compute gradient statistics
+    avg_grad_norm = sum(grad_norms) / len(grad_norms) if grad_norms else 0.0
+    max_grad_norm = max(grad_norms) if grad_norms else 0.0
+    clip_frequency = clip_count / len(grad_norms) if grad_norms else 0.0
     
     # TensorBoard logging
     writer.add_scalar('Loss/train_total', total_loss, epoch)
     for key, value in losses_dict.items():
         writer.add_scalar(f'Loss/train_{key}', value, epoch)
     
+    # Log gradient statistics
+    writer.add_scalar('Gradients/norm_avg', avg_grad_norm, epoch)
+    writer.add_scalar('Gradients/norm_max', max_grad_norm, epoch)
+    writer.add_scalar('Gradients/clip_frequency', clip_frequency, epoch)
+    writer.add_scalar('Gradients/clip_threshold', config['training']['gradient_clip'], epoch)
+    
     # Log KL weight for monitoring
     if epoch > 0:
         writer.add_scalar('KL/weight', losses.get('kl_weight', 0.0), epoch)
     
-    return total_loss, losses_dict
+    # Return losses and gradient statistics
+    grad_stats = {
+        'avg_norm': avg_grad_norm,
+        'max_norm': max_grad_norm,
+        'clip_freq': clip_frequency
+    }
+    
+    return total_loss, losses_dict, grad_stats
 
 
 def validate(model, loader, config, epoch, writer, device):
@@ -519,7 +565,7 @@ def main(args):
         print(f"{'='*60}")
         
         # Train
-        train_loss, losses_dict = train_epoch(
+        train_loss, losses_dict, grad_stats = train_epoch(
             model, train_loader, optimizer, scaler, config, epoch, writer, device
         )
         
@@ -529,6 +575,11 @@ def main(args):
             val_loss, val_losses_dict = validate(model, val_loader, config, epoch, writer, device)
             print(f"\nEpoch {epoch}:")
             print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            
+            # Print gradient statistics
+            print(f"  Grad Norm: avg={grad_stats['avg_norm']:.2f}, "
+                  f"max={grad_stats['max_norm']:.2f}, "
+                  f"clipped={grad_stats['clip_freq']*100:.1f}%")
             
             # Print training losses
             print(f"  Train - Part: {losses_dict['particle']:.4f}, "

@@ -73,8 +73,6 @@ class BipartiteDecoder(nn.Module):
         
         # Dimensions
         latent_dim = config['latent_dim']
-        edge_hidden = config['edge_hidden']
-        hyperedge_hidden = config['hyperedge_hidden']
         max_particles = config['max_particles']
         dropout = config['decoder']['dropout']
         jet_types = 3
@@ -141,11 +139,7 @@ class BipartiteDecoder(nn.Module):
             torch.arange(max_particles, dtype=torch.float32) / max(max_particles - 1, 1)
         )
         
-        # 4. Edge/Hyperedge decoders removed (PARTICLE-CENTRIC REFACTOR)
-        # Edge and hyperedge features will be recomputed from particles in HyperVAE
-        # Keep class definitions for backward compatibility but don't instantiate
-        
-        # 5. Jet Feature Decoder (configurable depth and width)
+        # 4. Jet Feature Decoder (configurable depth and width)
         # Read from new symmetric config structure
         jet_layers_count = config['decoder'].get('jet_layers', 2)
         jet_hidden_dim = config.get('jet_hidden', latent_dim)  # Read from top-level hidden dimensions
@@ -510,241 +504,11 @@ class ParticleFeatureDecoder(nn.Module):
         return particle_features
 
 
-class EdgeFeatureDecoder(nn.Module):
-    """Decode edge features with residual connections and per-edge variation"""
-    
-    def __init__(self, hidden_dim, num_heads, dropout, num_features=5, num_layers=3, variation_scale=0.1, max_edges=3600):
-        super().__init__()
-        
-        self.num_features = num_features
-        self.hidden_dim = hidden_dim
-        
-        # MLP layers with residual connections (matching encoder)
-        self.edge_mlp = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.LayerNorm(hidden_dim * 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.Dropout(dropout)
-            )
-            for _ in range(num_layers)
-        ])
-        
-        # Per-edge variation module (creates unique features per edge, like per-particle)
-        # Takes concatenated [hidden_dim + edge_index] and outputs per-edge variation
-        self.edge_variation = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim),  # +1 for normalized edge index
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        # Final projection to edge features
-        self.feature_proj = nn.Linear(hidden_dim, num_features)
-        
-        # Learnable scale for per-edge variation (configurable, learned during training)
-        # Controls how much each edge differs from the base representation
-        # Range: 0.0 (all edges identical) to 1.0 (full per-edge diversity)
-        self.variation_scale = nn.Parameter(torch.tensor(variation_scale))
-        
-        # Pre-compute and cache normalized edge indices [0, 1/(max-1), ..., 1.0]
-        # This avoids recomputing on every forward pass (efficiency optimization)
-        # Buffer is not a learnable parameter but moves with model to correct device
-        self.register_buffer(
-            'edge_indices_normalized',
-            torch.arange(max_edges, dtype=torch.float32) / max(max_edges - 1, 1)
-        )
-    
-    def forward(self, edge_h, edge_index_list, n_particles):
-        """
-        Generate edge features with per-edge variation (similar to per-particle variation).
-        
-        This fixes the broadcasting bug where all edges in a jet had identical features.
-        Now each edge gets unique features through the variation module + edge index.
-        
-        Args:
-            edge_h: Base edge embedding [batch_size, hidden_dim]
-            edge_index_list: List of edge_index tensors per graph
-            n_particles: Number of particles per graph (for compatibility)
-            
-        Returns:
-            edge_features: [batch_size, max_edges, num_features] with per-edge diversity
-        """
-        batch_size = edge_h.size(0)
-        device = edge_h.device
-        
-        # Apply MLP layers with residual connections
-        for layer in self.edge_mlp:
-            edge_h = edge_h + layer(edge_h)  # Residual connection
-        
-        # Count edges per jet
-        edge_counts = torch.tensor([ei.size(1) for ei in edge_index_list], 
-                                   dtype=torch.long, device=device)
-        max_edges = edge_counts.max().item()
-        
-        if max_edges == 0:
-            return torch.zeros(batch_size, 0, self.num_features, device=device)
-        
-        # Get cached normalized edge indices (pre-computed in __init__)
-        # Shape: [1, max_edges, 1] for broadcasting
-        edge_indices = self.edge_indices_normalized[:max_edges].view(1, max_edges, 1)
-        
-        # Expand base edge embedding to all edge positions [batch, max_edges, hidden]
-        edge_h_expanded = edge_h.unsqueeze(1).expand(batch_size, max_edges, -1)
-        
-        # Concatenate with normalized edge index [batch, max_edges, hidden+1]
-        # This allows the variation module to create unique features per edge position
-        edge_input = torch.cat([
-            edge_h_expanded,
-            edge_indices.expand(batch_size, -1, -1)
-        ], dim=-1)
-        
-        # Generate per-edge variation (single reshape + forward pass for efficiency)
-        # Input: [batch*max_edges, hidden+1] → Output: [batch*max_edges, hidden]
-        edge_variation = self.edge_variation(
-            edge_input.view(-1, self.hidden_dim + 1)
-        ).view(batch_size, max_edges, -1)
-        
-        # Combine base + scaled variation (learnable scale, kept in [0, 1] via sigmoid)
-        scale = torch.sigmoid(self.variation_scale)
-        edge_h_final = edge_h_expanded + edge_variation * scale
-        
-        # Project to edge features [batch, max_edges, num_features]
-        edge_features = self.feature_proj(edge_h_final)
-        
-        # Apply mask to zero out padding (invalid edges beyond edge_counts)
-        edge_mask = torch.arange(max_edges, device=device).unsqueeze(0) < edge_counts.unsqueeze(1)
-        edge_features = edge_features * edge_mask.unsqueeze(-1)
-        
-        return edge_features  # [batch_size, max_edges, num_features]
-
-
-class HyperedgeFeatureDecoder(nn.Module):
-    """
-    Decode hyperedge features with per-hyperedge variation.
-    
-    Supports modular n-point EEC generation:
-    - Each n-point group (3-pt, 4-pt, etc.) contributes features
-    - Total hyperedges = sum(C(n_particles, n) for n in n_point_eecs)
-    - Per-hyperedge variation ensures unique features (no broadcasting)
-    """
-    
-    def __init__(self, hidden_dim, num_heads, dropout, num_features=1, num_layers=2, 
-                 variation_scale=0.3, max_hyperedges=4060):
-        """
-        Args:
-            hidden_dim: Hidden dimension size
-            num_heads: Number of attention heads (kept for compatibility)
-            dropout: Dropout rate
-            num_features: Total number of hyperedge features (len(n_point_eecs) * features_per_group)
-            num_layers: Number of MLP layers with residual connections
-            variation_scale: Initial scale for per-hyperedge variation [0, 1]
-            max_hyperedges: Maximum number of hyperedges (for cached indices)
-        """
-        super().__init__()
-        
-        self.num_features = num_features
-        self.hidden_dim = hidden_dim
-        
-        # Use MLP instead of attention to save memory (for large hyperedge sets)
-        self.mlp_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.LayerNorm(hidden_dim * 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.Dropout(dropout)
-            )
-            for _ in range(num_layers)
-        ])
-        
-        self.feature_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, num_features)  # Configurable number of hyperedge features
-        )
-        
-        # Per-hyperedge variation module (creates unique features per hyperedge)
-        # Similar to EdgeFeatureDecoder - uses hyperedge index to create diversity
-        self.hyperedge_variation = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim),  # +1 for hyperedge index
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        # Pre-compute and cache normalized hyperedge indices (computed once, reused)
-        # Normalized indices [0, 1/(max_he-1), ..., 1.0]
-        # Leading hyperedges vs trailing hyperedges
-        self.register_buffer(
-            'hyperedge_indices_normalized',
-            torch.arange(max_hyperedges, dtype=torch.float32) / max(max_hyperedges - 1, 1)
-        )
-        
-        # Learnable scale for variation (configurable, similar to edge decoder)
-        # Controls how much per-hyperedge variation is applied
-        # Range: [0, 1] after sigmoid
-        self.variation_scale = nn.Parameter(torch.tensor(variation_scale))
-    
-    def forward(self, hyperedge_h, hyperedge_mask, n_hyperedges):
-        """
-        Generate hyperedge features with per-hyperedge variation.
-        
-        Args:
-            hyperedge_h: Base hyperedge representation [batch, hidden_dim]
-            hyperedge_mask: Mask for valid hyperedges [batch, max_hyperedges]
-            n_hyperedges: Number of hyperedges per jet [batch]
-        
-        Returns:
-            hyperedge_features: [batch, max_hyperedges, num_features]
-        """
-        batch_size = hyperedge_h.size(0)
-        max_he = hyperedge_mask.size(1)
-        device = hyperedge_h.device
-        
-        # Apply MLP with residual to base representation
-        hyperedge_h_base = hyperedge_h
-        for layer in self.mlp_layers:
-            hyperedge_h_base = hyperedge_h_base + layer(hyperedge_h_base)
-        
-        # Get cached normalized hyperedge indices (pre-computed in __init__)
-        # Shape: [max_he] → [1, max_he, 1] for broadcasting
-        hyperedge_indices = self.hyperedge_indices_normalized[:max_he].view(1, max_he, 1)
-        
-        # Expand base features to all hyperedges [batch, max_he, hidden]
-        hyperedge_h_expanded = hyperedge_h_base.unsqueeze(1).expand(batch_size, max_he, -1)
-        
-        # Concatenate with normalized index [batch, max_he, hidden+1]
-        # This allows the variation module to create unique features per hyperedge position
-        hyperedge_input = torch.cat([
-            hyperedge_h_expanded, 
-            hyperedge_indices.expand(batch_size, -1, -1)
-        ], dim=-1)
-        
-        # Generate per-hyperedge variation (single reshape + forward pass for efficiency)
-        # Input: [batch*max_he, hidden+1] → Output: [batch*max_he, hidden]
-        hyperedge_variation = self.hyperedge_variation(
-            hyperedge_input.view(-1, self.hidden_dim + 1)
-        ).view(batch_size, max_he, -1)
-        
-        # Combine base + scaled variation (learnable scale, kept in [0, 1] via sigmoid)
-        scale = torch.sigmoid(self.variation_scale)
-        hyperedge_h_final = hyperedge_h_expanded + hyperedge_variation * scale
-        
-        # Generate features and apply mask in one operation
-        hyperedge_features = self.feature_proj(hyperedge_h_final) * hyperedge_mask.unsqueeze(-1)
-        
-        return hyperedge_features
-
-
 if __name__ == "__main__":
     # Test decoder
     config = {
         'latent_dim': 128,
         'particle_hidden': 64,
-        'edge_hidden': 48,
-        'hyperedge_hidden': 32,
         'max_particles': 150,
         'decoder': {
             'mlp_layers': 3,

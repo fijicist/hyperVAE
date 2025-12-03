@@ -263,7 +263,7 @@ def construct_n_point_hyperedges(num_nodes, old_x, additional_hypergraph_attrs, 
     return hyperedge_index, hyperedge_attr
 
 
-def get_eec_ls_values(data, N = 2, bins = 50, axis_range = (1e-3, 1), print_every=-10):
+def get_eec_ls_values(data, N = 2, bins = 50, axis_range = (1e-3, 1), print_every=-10, track_covariance=False):
     """
     Get the EEC values for the given data.
     
@@ -294,7 +294,7 @@ def get_eec_ls_values(data, N = 2, bins = 50, axis_range = (1e-3, 1), print_ever
     # Ensure elements are Python floats (not numpy types)
     axis_range = [float(x) for x in axis_range]
     
-    eec_ls = eec.EECLongestSideLog(N, bins, axis_range, print_every=print_every)
+    eec_ls = eec.EECLongestSideLog(N, bins, axis_range, print_every=print_every, track_covariance=track_covariance)
 
     # Multicore compute for EECLongestSide
     eec_ls(data)
