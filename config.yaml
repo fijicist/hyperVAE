@@ -119,10 +119,10 @@ model:
     # training.final_temperature, and training.temperature_decay settings below
 
 training:
-  batch_size: 32                  # Effective batch = 64 * 4 = 256
+  batch_size: 64                  # Effective batch = 64 * 4 = 256
   gradient_accumulation_steps: 8  # Good for memory constraints
   epochs: 200
-  learning_rate: 0.0003           # Finer updates for stability
+  learning_rate: 0.00015           # Finer updates for stability
   weight_decay: 0.005             # Keep: L2 regularization
   latent_noise: 0.05              # Keep: noise for regularization
   mixed_precision: true           # Enable mixed precision training (FP16/BF16)
@@ -136,7 +136,7 @@ training:
   # Scheduler
   scheduler: "cosine"
   warmup_epochs: 20
-  min_lr: 0.00003
+  min_lr: 0.000015
   
   # Loss weights for different components
   loss_weights:
@@ -167,7 +167,7 @@ training:
     # Hyperbolic Chamfer distance configuration
     # Uses hyperbolic geometry transformation: d_hyp = arcosh(1 + α × d_E²)
     # Paper: arXiv:2412.17951 shows hyperbolic Chamfer better captures jet structure
-    hyperbolic_alpha: 0.5        # Hyperparameter controlling hyperbolic curvature
+    hyperbolic_alpha: 1.0        # Hyperparameter controlling hyperbolic curvature
                                  # α → 0: recovers standard Chamfer
                                  # α > 0: stronger hyperbolic effect, emphasizes large distances
     

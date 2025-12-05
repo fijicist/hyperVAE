@@ -89,13 +89,22 @@ class BipartiteDecoder(nn.Module):
         # Pre-projection for residual
         self.latent_pre_proj = nn.Linear(latent_dim + jet_types, output_dim)
         
-        # Main expansion path
+        # Main expansion path - DEEPER for better expressivity
+        # 3 hidden layers with increasing then decreasing width
         self.latent_expander = nn.Sequential(
-            nn.Linear(latent_dim + jet_types, latent_dim * 2),
+            nn.Linear(latent_dim + jet_types, latent_dim * 3),
+            nn.LayerNorm(latent_dim * 3),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim * 3, latent_dim * 2),
             nn.LayerNorm(latent_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(latent_dim * 2, output_dim)
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim, output_dim)
         )
         
         # 2. Topology Decoder (PARTICLE-CENTRIC: only predicts particle existence)
@@ -107,12 +116,19 @@ class BipartiteDecoder(nn.Module):
         # 3. Particle Feature Decoder using official L-GATr
         self.particle_decoder = LGATrParticleDecoder(config)
         
-        # 3.5. Per-particle variation module (CRITICAL FIX for particle diversity)
+        # 3.5. Per-particle variation module (for particle diversity)
         # Creates unique features per particle using particle index + latent
         # Prevents all particles from having identical initial states
+        # DEEPER architecture for better expressivity
         self.particle_variation = nn.Sequential(
-            nn.Linear(lgatr_scalar_dim + 1, lgatr_scalar_dim),  # +1 for particle index
+            nn.Linear(lgatr_scalar_dim + 1, lgatr_scalar_dim * 2),  # +1 for particle index
+            nn.LayerNorm(lgatr_scalar_dim * 2),
             nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(lgatr_scalar_dim * 2, lgatr_scalar_dim),
+            nn.LayerNorm(lgatr_scalar_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(lgatr_scalar_dim, lgatr_scalar_dim)
         )
         
@@ -125,11 +141,18 @@ class BipartiteDecoder(nn.Module):
         # 3.6. Initial 4-momentum projection from per-particle scalars
         # Projects unique per-particle scalars to initial 4-momentum guess
         # This gives L-GATr meaningful, diverse starting points for refinement
-        self.scalar_to_4mom_init = nn.Sequential(
-            nn.Linear(lgatr_scalar_dim, lgatr_scalar_dim),
+        # DEEPER architecture with intermediate hidden layers for better expressivity
+        self.scalar_to_4mom_hidden = nn.Sequential(
+            nn.Linear(lgatr_scalar_dim, lgatr_scalar_dim * 2),
+            nn.LayerNorm(lgatr_scalar_dim * 2),
             nn.GELU(),
-            nn.Linear(lgatr_scalar_dim, 4)
+            nn.Dropout(dropout),
+            nn.Linear(lgatr_scalar_dim * 2, lgatr_scalar_dim),
+            nn.LayerNorm(lgatr_scalar_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
         )
+        self.scalar_to_4mom_out = nn.Linear(lgatr_scalar_dim, 4)
         
         # Pre-compute and cache particle indices for efficiency (computed once, reused)
         # Normalized indices [0, 1/(max_p-1), 2/(max_p-1), ..., 1.0]
@@ -267,10 +290,12 @@ class BipartiteDecoder(nn.Module):
         
         # Generate per-particle initial 4-momenta [batch, max_p, 4]
         # Each particle gets unique initial guess based on its position and latent
-        # Reuse flattened tensor, single reshape at end
-        initial_fourmomenta = self.scalar_to_4mom_init(
-            particle_scalars_expanded.view(-1, lgatr_scalar_dim)
-        ).view(batch_size_actual, max_p, 4)
+        # Use deeper projection with residual connection for better expressivity
+        scalars_flat = particle_scalars_expanded.view(-1, lgatr_scalar_dim)
+        hidden_4mom = self.scalar_to_4mom_hidden(scalars_flat)
+        # Residual connection before final projection
+        hidden_4mom = hidden_4mom + scalars_flat
+        initial_fourmomenta = self.scalar_to_4mom_out(hidden_4mom).view(batch_size_actual, max_p, 4)
         
         # Add small noise for regularization (stochastic gradient)
         initial_fourmomenta = initial_fourmomenta + torch.randn_like(initial_fourmomenta) * 0.01
@@ -353,157 +378,6 @@ class TopologyDecoder(nn.Module):
         }
 
 
-class ParticleFeatureDecoder(nn.Module):
-    """Decode particle features with edge/hyperedge context via cross-attention"""
-    
-    def __init__(self, hidden_dim, num_heads, dropout, edge_hidden=None, hyperedge_hidden=None, 
-                 feature_proj_dropout=0.2, num_features=3, num_layers=4,
-                 rapidity_index=1, phi_index=2, y_range=4.0, phi_range=3.141592653589793):
-        super().__init__()
-        
-        self.hidden_dim = hidden_dim
-        self.num_features = num_features
-        self.num_layers = num_layers
-        
-        # Physical constraints / indices for generated particle features
-        self.rapidity_index = int(rapidity_index)
-        self.phi_index = int(phi_index)
-        self.y_range = float(y_range)
-        self.phi_range = float(phi_range)
-        
-        self.lgat_layers = nn.ModuleList([
-            LGATrLayer(hidden_dim, num_heads, dropout)
-            for _ in range(num_layers)
-        ])
-        
-        # Projection layers to match dimensions for cross-attention
-        # edge_hidden (96) -> particle_hidden (128)
-        # hyperedge_hidden (64) -> particle_hidden (128)
-        # CRITICAL: Initialize with small weights to prevent gradient explosion
-        if edge_hidden is not None and edge_hidden != hidden_dim:
-            self.edge_proj = nn.Linear(edge_hidden, hidden_dim)
-            nn.init.xavier_uniform_(self.edge_proj.weight, gain=0.01)  # Small init
-            nn.init.zeros_(self.edge_proj.bias)
-        else:
-            self.edge_proj = None
-        
-        if hyperedge_hidden is not None and hyperedge_hidden != hidden_dim:
-            self.hyperedge_proj = nn.Linear(hyperedge_hidden, hidden_dim)
-            nn.init.xavier_uniform_(self.hyperedge_proj.weight, gain=0.01)  # Small init
-            nn.init.zeros_(self.hyperedge_proj.bias)
-        else:
-            self.hyperedge_proj = None
-        
-        # Cross-attention layers to incorporate edge/hyperedge context
-        self.edge_cross_attn = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.hyperedge_cross_attn = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        
-        # Layer norms for cross-attention
-        self.edge_norm = nn.LayerNorm(hidden_dim)
-        self.hyperedge_norm = nn.LayerNorm(hidden_dim)
-        
-        # Scaling factor for cross-attention (FIXED, not learnable)
-        # Prevents cross-attention from overwhelming particle features
-        self.cross_attn_scale = 0.1  # Fixed at 10%, not learnable
-        
-        # Feature predictors - DEEPER and WIDER for better expressivity
-        # Dynamically create projectors based on num_features
-        # 3-layer MLPs with hidden_dim (not hidden//2) to break plateau
-        self.feature_projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(feature_proj_dropout),
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Dropout(feature_proj_dropout),
-                nn.Linear(hidden_dim // 2, 1)
-            )
-            for _ in range(num_features)
-        ])
-    
-    def forward(self, particle_h, particle_mask, n_particles, edge_context=None, hyperedge_context=None):
-        """
-        Args:
-            particle_h: [batch_size, particle_hidden_dim]
-            particle_mask: [batch_size, max_particles]
-            n_particles: [batch_size]
-            edge_context: [batch_size, edge_hidden_dim] - edge embeddings (optional)
-            hyperedge_context: [batch_size, hyperedge_hidden_dim] - hyperedge embeddings (optional)
-        """
-        batch_size = particle_h.size(0)
-        max_p = particle_mask.size(1)
-        device = particle_h.device
-        
-        # Expand to max_particles
-        particle_h_expanded = particle_h.unsqueeze(1).expand(batch_size, max_p, -1)
-        
-        # Apply L-GATr layers with residual connections per sample
-        for layer in self.lgat_layers:
-            residual = particle_h_expanded  # Store for residual connection
-            particle_h_expanded = particle_h_expanded.reshape(-1, self.hidden_dim)
-            particle_h_expanded = layer(particle_h_expanded)
-            particle_h_expanded = particle_h_expanded.reshape(batch_size, max_p, -1)
-            # Residual connection: helps preserve particle-specific information
-            particle_h_expanded = particle_h_expanded + residual
-        
-        # Cross-attention with edge context (if provided during training)
-        # CRITICAL: Scale down attention output to prevent overwhelming particle features
-        if edge_context is not None:
-            # Project edge context to particle dimension if needed
-            if self.edge_proj is not None:
-                edge_context = self.edge_proj(edge_context)
-            
-            edge_ctx = edge_context.unsqueeze(1)  # [B, 1, particle_hidden_dim]
-            attn_out, _ = self.edge_cross_attn(
-                particle_h_expanded, edge_ctx, edge_ctx
-            )
-            # Scale down the attention contribution (starts at 0.1, learned during training)
-            particle_h_expanded = self.edge_norm(particle_h_expanded + self.cross_attn_scale * attn_out)
-        
-        # Cross-attention with hyperedge context (if provided during training)
-        if hyperedge_context is not None:
-            # Project hyperedge context to particle dimension if needed
-            if self.hyperedge_proj is not None:
-                hyperedge_context = self.hyperedge_proj(hyperedge_context)
-            
-            he_ctx = hyperedge_context.unsqueeze(1)  # [B, 1, particle_hidden_dim]
-            attn_out, _ = self.hyperedge_cross_attn(
-                particle_h_expanded, he_ctx, he_ctx
-            )
-            # Scale down the attention contribution (same learnable scale)
-            particle_h_expanded = self.hyperedge_norm(particle_h_expanded + self.cross_attn_scale * attn_out)
-        
-        # Generate features dynamically based on num_features
-        # CRITICAL: Output in NORMALIZED space to match input data!
-        features = []
-        for projector in self.feature_projectors:
-            feature = projector(particle_h_expanded).squeeze(-1)
-            feature = feature * particle_mask  # Apply mask
-            features.append(feature)
-        
-        # Stack features [batch_size, max_particles, num_features]
-        particle_features = torch.stack(features, dim=-1)
-        
-        # Apply physical constraints to rapidity (y) and phi channels
-        # Use tanh scaling to keep outputs differentiable and strictly within bounds
-        if 0 <= self.rapidity_index < self.num_features:
-            particle_features[..., self.rapidity_index] = torch.tanh(
-                particle_features[..., self.rapidity_index]
-            ) * self.y_range
-
-        if 0 <= self.phi_index < self.num_features:
-            particle_features[..., self.phi_index] = torch.tanh(
-                particle_features[..., self.phi_index]
-            ) * self.phi_range
-
-        return particle_features
-
-
 if __name__ == "__main__":
     # Test decoder
     config = {
@@ -526,5 +400,5 @@ if __name__ == "__main__":
     output = decoder(z, jet_type)
     
     print(f"Particle features: {output['particle_features'].shape}")
-    print(f"Edge features: {output['edge_features'].shape}")
-    print(f"Hyperedge features: {output['hyperedge_features'].shape}")
+    print(f"Particle mask: {output['particle_mask'].shape}")
+    print(f"Jet features: {output['jet_features'].shape}")

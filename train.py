@@ -608,6 +608,19 @@ def main(args):
                     'config': config
                 }, os.path.join(args.save_dir, 'best_model.pt'))
                 print(f"Saved best model (val_loss: {val_loss:.4f})")
+        else:
+            # Print gradient statistics for every epoch even if not validating
+            print(f"  Grad Norm: avg={grad_stats['avg_norm']:.2f}, "
+                  f"max={grad_stats['max_norm']:.2f}, "
+                  f"clipped={grad_stats['clip_freq']*100:.1f}%")
+            
+            # Print training losses for every epoch even if not validating
+            print(f"  Train - Part: {losses_dict['particle']:.4f}, "
+                  f"Edge Dist: {losses_dict['edge_distribution']:.4f}, "
+                  f"Hyper Dist: {losses_dict['hyperedge_distribution']:.4f}, "
+                  f"Jet: {losses_dict['jet']:.4f}, "
+                  f"Cons: {losses_dict['consistency']:.4f}, "
+                  f"KL: {losses_dict['kl']:.4f} (w={losses_dict.get('kl_weight', 0.0):.4f})")
         
         # Save checkpoint
         save_every = config['training'].get('save_every', 20)
