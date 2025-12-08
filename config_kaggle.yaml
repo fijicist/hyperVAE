@@ -44,9 +44,10 @@ model:
       attention:
         num_heads: 4            # Multi-head attention (4 heads standard)
         multi_query: true       # Memory-efficient attention (critical for 4GB VRAM)
-        dropout_prob: 0.25           # Attention dropout
+        dropout_prob: 0.1           # Attention dropout
         # use_flash_attention: false  # Flash attention (requires flash-attn package)
         head_scale: true     # Enable head scaling for stability
+        xformer: "flash-attention"  # Use flash attention for speed and memory efficiency
         
       # MLP Configuration (between attention layers)
       mlp:
@@ -63,7 +64,7 @@ model:
     jet_layers: 3             # Number of MLP layers for jet features
     
     # Regularization
-    dropout: 0.3             # Dropout rate for all encoder layers (non-LGATr)
+    dropout: 0.2             # Dropout rate for all encoder layers (non-LGATr)
     use_residual: true        # Enable residual connections (applies to all layers)
   
   decoder:
@@ -92,9 +93,10 @@ model:
       attention:
         num_heads: 4            # Multi-head attention (match encoder)
         multi_query: true       # Memory-efficient attention
-        dropout_prob: 0.25            # Attention dropout (match encoder)
+        dropout_prob: 0.1            # Attention dropout (match encoder)
         # use_flash_attention: false  # Flash attention
         head_scale: true     # Enable head scaling for stability
+        xformer: "flash-attention"  # Use flash attention for speed and memory efficiency
         
       # MLP Configuration (between attention layers)
       mlp:
@@ -102,8 +104,8 @@ model:
         num_hidden_layers: 3   # MLP depth in each block
     
     # Regularization
-    dropout: 0.3              # Dropout rate for all decoder layers
-    feature_proj_dropout: 0.3 # Dropout for feature projection layers
+    dropout: 0.2             # Dropout rate for all decoder layers
+    feature_proj_dropout: 0.2 # Dropout for feature projection layers
 
     # Per-particle variation scale (CRITICAL for diverse particle generation)
     # Controls how much each particle differs from others in a jet
@@ -119,11 +121,11 @@ model:
     # training.final_temperature, and training.temperature_decay settings below
 
 training:
-  batch_size: 64                  # Effective batch = 64 * 4 = 256
-  gradient_accumulation_steps: 4  # Good for memory constraints
-  epochs: 200
-  learning_rate: 0.00015           # Finer updates for stability
-  weight_decay: 0.0025             # Keep: L2 regularization
+  batch_size: 128                  # Effective batch = 64 * 4 = 256
+  gradient_accumulation_steps: 8  # Good for memory constraints
+  epochs: 400
+  learning_rate: 0.0005           # Finer updates for stability
+  weight_decay: 0.01             # Keep: L2 regularization
   latent_noise: 0.05              # Keep: noise for regularization
   mixed_precision: true           # Enable mixed precision training (FP16/BF16)
   precision_type: "fp16"          # Precision type: "fp16" (Volta+/Turing+) or "bf16" (Ampere+, better stability)
@@ -136,7 +138,7 @@ training:
   # Scheduler
   scheduler: "cosine"
   warmup_epochs: 20
-  min_lr: 0.000015
+  min_lr: 0.00005
   
   # Loss weights for different components
   loss_weights:
@@ -144,7 +146,7 @@ training:
     jet_features: 4000.0             # Jet-level feature loss (jet_pt, jet_eta, jet_mass)
     edge_distribution: 5000.0           # Edge distribution matching (2-pt EEC + observables)
     hyperedge_distribution: 4000.0      # Hyperedge distribution matching (3-pt+ EEC)
-    local_global_consistency: 100.0 # Physics consistency: particles → jet observables
+    local_global_consistency: 300.0 # Physics consistency: particles → jet observables
     kl_divergence: 1.0               # Gentle regularization
   
   # Loss function configuration
@@ -192,7 +194,7 @@ training:
     # Enforces agreement between generated particle 4-momenta and true jet-level features
     # Computes jet observables (pT, η, m) from particles and compares to true jet values
     use_consistency_loss: true  # Enable local→global consistency loss
-    consistency_pt_weight: 4.0  # Weight for pT residual (most important, affects trigger/selection)
+    consistency_pt_weight: 2.5  # Weight for pT residual (most important, affects trigger/selection)
     consistency_eta_weight: 0.5  # Weight for η residual (detector geometry, less critical)
     consistency_mass_weight: 5.0  # Weight for mass residual (physics discriminant, e.g., top/W/Z tagging)
     
@@ -210,7 +212,7 @@ training:
                                  # Reset every 30 epochs to prevent explosion
   kl_free_bits: 2.0              # Free bits
                                  # Allows KL to grow naturally but not collapse to 0
-  kl_max_weight: 0.55            # TUNED: Max multiplier for kl_divergence weight
+  kl_max_weight: 0.75            # TUNED: Max multiplier for kl_divergence weight
                                  # Effective max KL weight = 0.3 * 0.25 = 0.075
 
   # Gumbel-Softmax Temperature Annealing
@@ -218,7 +220,7 @@ training:
   # Higher temp → softer/more random, Lower temp → sharper/more deterministic
   # Annealing schedule: temp(epoch) = final_temp + (initial_temp - final_temp) × decay^epoch
   initial_temperature: 10.0       # Start with very soft sampling (explore topology space)
-  final_temperature: 0.75         # End with sharp sampling (confident discrete choices)
+  final_temperature: 0.25         # End with sharp sampling (confident discrete choices)
   temperature_decay: 0.98        # Exponential decay rate (0.98^100 ≈ 0.13, aggressive annealing)
   
   # Checkpointing
@@ -226,7 +228,7 @@ training:
   validate_every: 5
   
   # Early stopping
-  patience: 50
+  patience: 100
   min_delta: 0.001
 
 # Data

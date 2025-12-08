@@ -151,6 +151,7 @@ Issue: Val loss much higher than train loss
 """
 import torch
 import torch.optim as optim
+from lion_pytorch import Lion
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
@@ -500,7 +501,13 @@ def main(args):
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
     # Optimizer
-    optimizer = optim.AdamW(
+    # optimizer = optim.AdamW(
+    #     model.parameters(),
+    #     lr=config['training']['learning_rate'],
+    #     weight_decay=config['training']['weight_decay']
+    # )
+    
+    optimizer = Lion(
         model.parameters(),
         lr=config['training']['learning_rate'],
         weight_decay=config['training']['weight_decay']
