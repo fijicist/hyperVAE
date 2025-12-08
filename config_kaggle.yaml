@@ -47,7 +47,6 @@ model:
         dropout_prob: 0.1           # Attention dropout
         # use_flash_attention: false  # Flash attention (requires flash-attn package)
         head_scale: true     # Enable head scaling for stability
-        xformer: "flash-attention"  # Use flash attention for speed and memory efficiency
         
       # MLP Configuration (between attention layers)
       mlp:
@@ -96,7 +95,6 @@ model:
         dropout_prob: 0.1            # Attention dropout (match encoder)
         # use_flash_attention: false  # Flash attention
         head_scale: true     # Enable head scaling for stability
-        xformer: "flash-attention"  # Use flash attention for speed and memory efficiency
         
       # MLP Configuration (between attention layers)
       mlp:
