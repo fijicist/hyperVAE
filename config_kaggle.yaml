@@ -101,6 +101,9 @@ model:
         activation: "gelu"      # GELU activation (standard for transformers)
         num_hidden_layers: 3   # MLP depth in each block
     
+    # Jet feature decoder configuration
+    jet_layers: 3            # Number of MLP layers for jet feature decoding (matches encoder)
+    
     # Regularization
     dropout: 0.2             # Dropout rate for all decoder layers
     feature_proj_dropout: 0.2 # Dropout for feature projection layers

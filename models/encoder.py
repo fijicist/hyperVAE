@@ -106,6 +106,7 @@ class BipartiteEncoder(nn.Module):
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(edge_hidden * 2, edge_hidden),
+                nn.LayerNorm(edge_hidden),  # Added LayerNorm for stability
                 nn.Dropout(dropout)
             )
             for _ in range(config['encoder'].get('edge_layers', config['encoder'].get('edge_transformer_layers', 3)))
@@ -127,9 +128,10 @@ class BipartiteEncoder(nn.Module):
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hyperedge_hidden * 2, hyperedge_hidden),
+                nn.LayerNorm(hyperedge_hidden),  # Added LayerNorm for stability
                 nn.Dropout(dropout)
             )
-            for _ in range(config['encoder'].get('hyperedge_layers', config['encoder'].get('hyperedge_lgat_layers', 2)))
+            for _ in range(config['encoder'].get('hyperedge_layers', config['encoder'].get('hyperedge_lgat_layers', 3)))
         ])
         
         # 4. Jet-level feature encoder with residual connections
@@ -141,7 +143,7 @@ class BipartiteEncoder(nn.Module):
             nn.GELU()
         )
         
-        # Jet MLP layers with residual connections
+        # Jet MLP layers with residual connections (IMPROVED: match edge/hyperedge structure)
         self.jet_mlp = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(jet_hidden, jet_hidden * 2),
@@ -149,9 +151,10 @@ class BipartiteEncoder(nn.Module):
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(jet_hidden * 2, jet_hidden),
+                nn.LayerNorm(jet_hidden),  # Added LayerNorm for stability
                 nn.Dropout(dropout)
             )
-            for _ in range(config['encoder'].get('jet_layers', 2))
+            for _ in range(config['encoder'].get('jet_layers', 3))
         ])
         
         # 5. Bipartite cross-attention (use particle_output_dim instead of particle_hidden)
@@ -176,8 +179,12 @@ class BipartiteEncoder(nn.Module):
         # Project fused features to latent_dim*2 for residual connection
         self.fusion_pre_proj = nn.Linear(fusion_dim, latent_dim * 2)
         
-        # Main fusion MLP
+        # Deeper fusion MLP for better feature integration (3 layers)
         self.fusion_mlp = nn.Sequential(
+            nn.Linear(latent_dim * 2, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(latent_dim * 2, latent_dim * 2),
             nn.LayerNorm(latent_dim * 2),
             nn.GELU(),
@@ -371,7 +378,7 @@ class BipartiteEncoder(nn.Module):
 
 
 class BipartiteCrossAttention(nn.Module):
-    """Cross-attention between particle and hyperedge representations"""
+    """Cross-attention between particle and hyperedge representations (IMPROVED)"""
     
     def __init__(self, particle_dim, hyperedge_dim, num_heads=4, dropout=0.1):
         super().__init__()
@@ -383,6 +390,8 @@ class BipartiteCrossAttention(nn.Module):
         self.v_proj = nn.Linear(hyperedge_dim, particle_dim)
         self.o_proj = nn.Linear(particle_dim, particle_dim)
         
+        # Added for better expressivity
+        self.norm = nn.LayerNorm(particle_dim)
         self.dropout = nn.Dropout(dropout)
         self.scale = self.head_dim ** -0.5
     
@@ -405,6 +414,7 @@ class BipartiteCrossAttention(nn.Module):
         out = attn_weights.unsqueeze(-1) * v
         out = out.view(batch_size, -1)
         out = self.o_proj(out)
+        out = self.norm(out)  # Added normalization
         
         return out
 

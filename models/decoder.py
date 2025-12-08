@@ -163,10 +163,9 @@ class BipartiteDecoder(nn.Module):
         )
         
         # 4. Jet Feature Decoder (configurable depth and width)
-        # Read from new symmetric config structure
-        jet_layers_count = config['decoder'].get('jet_layers', 2)
-        jet_hidden_dim = config.get('jet_hidden', latent_dim)  # Read from top-level hidden dimensions
-        jet_dropout = config['decoder'].get('dropout', 0.2)  # Use general decoder dropout
+        jet_layers_count = config['decoder'].get('jet_layers', 3)  
+        jet_hidden_dim = config.get('jet_hidden', latent_dim)  
+        jet_dropout = config['decoder'].get('dropout', 0.2)
         feature_proj_dropout = config['decoder'].get('feature_proj_dropout', 0.2)
         
         # Build jet feature decoder with configurable depth
@@ -192,12 +191,17 @@ class BipartiteDecoder(nn.Module):
         
         self.jet_mlp = nn.Sequential(*jet_layers)
         
-        # Deep feature projectors (similar to particle projectors)
-        # One 3-layer MLP per jet feature: jet_pt, jet_eta, jet_mass
+        # Deeper feature projectors for better expressivity (4-layer MLPs)
+        # One projector per jet feature: jet_pt, jet_eta, jet_mass
         num_jet_features = config.get('jet_features', 3)
         self.jet_feature_projectors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(jet_hidden_dim, jet_hidden_dim),
+                nn.LayerNorm(jet_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(feature_proj_dropout),
+                nn.Linear(jet_hidden_dim, jet_hidden_dim),
+                nn.LayerNorm(jet_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(feature_proj_dropout),
                 nn.Linear(jet_hidden_dim, jet_hidden_dim // 2),
