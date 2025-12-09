@@ -510,7 +510,9 @@ def main(args):
     optimizer = Lion(
         model.parameters(),
         lr=config['training']['learning_rate'],
-        weight_decay=config['training']['weight_decay']
+        weight_decay=config['training']['weight_decay'], 
+        betas=(0.95, 0.98), 
+        use_triton=True
     )
     
     # Learning rate scheduler
