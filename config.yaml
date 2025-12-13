@@ -134,7 +134,7 @@ training:
   # Gradient clipping (increased for squared distance metric)
   # Squared distance has linear gradients (∂d²/∂x = 2x) which are more stable than
   # Euclidean gradients (∂√d²/∂x = x/d) that can spike for small errors
-  gradient_clip: 15.0
+  gradient_clip: 5.0
   
   # Scheduler
   scheduler: "cosine"

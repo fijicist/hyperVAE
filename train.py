@@ -35,10 +35,13 @@ Key Features:
    - Example: batch=64, steps=4 → effective batch=256
    - Critical for memory-constrained GPUs
 
-3. GRADIENT CLIPPING:
-   - Clamps gradient norm to prevent explosion
-   - Especially important with squared distance loss (stronger gradients)
-   - Typical: gradient_clip=1.5 for squared distance
+3. GRADIENT CLIPPING (ZClip - Adaptive Method):
+   - Uses ZClip: EMA-based adaptive gradient clipping
+   - Dynamically adjusts clipping threshold based on gradient statistics
+   - Automatically detects and mitigates gradient spikes (z-score > 2.5)
+   - More stable than fixed-threshold clipping for high learning rates
+   - Config: gradient_clip=15.0 sets hard cap, ZClip adapts within this limit
+   - Warmup: 25 steps to initialize gradient norm statistics
 
 4. KL ANNEALING:
    - β(epoch) = min(1.0, epoch / warmup_epochs) × kl_max_weight
@@ -90,8 +93,8 @@ training:
   batch_size: 64                      # Per-GPU batch size
   learning_rate: 0.0001              # Adam LR
   epochs: 200                        # Total epochs
-  gradient_accumulation_steps: 4     # Effective batch = 64×4=256
-  gradient_clip: 1.5                 # Gradient clipping threshold
+  gradient_accumulation_steps: 4     # Effective batch = 64x4=256
+  gradient_clip: 1.0                 # Gradient clipping threshold (hard cap for ZClip)
   mixed_precision: true              # Use FP16/BF16
   precision_type: "fp16"             # "fp16" (Volta/Turing) or "bf16" (Ampere+)
   kl_warmup_epochs: 100              # KL annealing warmup
@@ -128,14 +131,19 @@ Healthy training should show:
 Troubleshooting:
 ----------------
 Issue: Loss not decreasing
-- Check gradient_clip (too low = no progress, too high = instability)
+- ZClip adaptive clipping should handle gradient spikes automatically
+- Monitor gradient norms in TensorBoard to see spike patterns
+- If training unstable, reduce clip_factor in ZClip init (1.0 → 0.7)
+- Increase max_grad_norm in config (15.0 → 20.0) for higher hard cap
 - Check KL weight (if KL >> recon, model ignores decoder)
 - Check use_squared_distance=true (euclidean has vanishing gradients)
 
 Issue: NaN in training
 - Check encoder clamping (mu, logvar in [-10, 10])
 - Check KL computation (should clamp per-dim KL)
-- Reduce learning rate or increase gradient_clip
+- ZClip helps prevent gradient explosions leading to NaN
+- If NaNs persist, reduce clip_factor to 0.5 for aggressive clipping
+- Reduce learning rate as backup option
 
 Issue: OOM (Out of Memory)
 - Reduce batch_size (64 → 32)
@@ -158,12 +166,13 @@ import yaml
 import os
 from tqdm import tqdm
 import argparse
+from zclip import ZClip
 
 from data.bipartite_dataset import BipartiteJetDataset, collate_bipartite_batch, create_train_val_test_split
 from models.hypervae import BipartiteHyperVAE
 
 
-def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device):
+def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, device):
     """Train for one epoch"""
     model.train()
     
@@ -246,31 +255,69 @@ def train_epoch(model, loader, optimizer, scaler, config, epoch, writer, device)
         
         # Gradient accumulation
         if (i + 1) % accumulation_steps == 0:
-            # Gradient clipping
+            
+            # Unscale gradients for ZClip (required for mixed precision)
             scaler.unscale_(optimizer)
             
-            # Compute gradient norm before clipping (OPTIMIZED - avoid multiple .item() calls)
-            # Stack all gradient norms into a single tensor, then compute on GPU
-            grad_norms_tensor = torch.stack([
-                p.grad.data.norm(2) 
-                for p in model.parameters() 
-                if p.grad is not None
-            ])
-            total_norm = torch.norm(grad_norms_tensor, 2).item()  # Single GPU→CPU sync
+            # ZClip.step() performs:
+            # 1. Compute total gradient norm across all parameters
+            # 2. Check if norm is a statistical outlier (z-score > z_thresh)
+            # 3. If spike detected, adaptively compute clipping threshold:
+            #    threshold = mean + (z_thresh × std) / (z/z_thresh) × clip_factor
+            # 4. Apply in-place gradient clipping if needed
+            # 5. Update EMA statistics (mean, variance) for next iteration
+            #
+            # Returns: total_norm (before clipping) for monitoring
+            total_norm = zclip.step(model)
             
-            # Track gradient norm
+            # Track gradient norm for logging
             grad_norms.append(total_norm)
             
-            # Check if clipping will occur
+            # Track clipping frequency (check if clipping occurred)
+            # ZClip clips when: z-score > z_thresh (spike detected)
             gradient_clip_threshold = config['training']['gradient_clip']
             if total_norm > gradient_clip_threshold:
                 clip_count += 1
             
-            # Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
-                gradient_clip_threshold
-            )
+            # ───────────────────────────────────────────────────────────────
+            # OLD CLIPPING METHOD (PRESERVED FOR REFERENCE / ROLLBACK)
+            # ───────────────────────────────────────────────────────────────
+            # Fixed-threshold gradient clipping using PyTorch's built-in method.
+            # This clips all gradients if total norm exceeds a fixed threshold.
+            # 
+            # Limitations:
+            # - Fixed threshold doesn't adapt to training dynamics
+            # - May clip too aggressively during stable phases
+            # - May clip too conservatively during volatile phases
+            # - Requires manual tuning for different learning rates/models
+            #
+            # To revert to old clipping:
+            # 1. Comment out: total_norm = zclip.step(model)
+            # 2. Uncomment the code below:
+            # ───────────────────────────────────────────────────────────────
+            # # Compute gradient norm before clipping (OPTIMIZED - avoid multiple .item() calls)
+            # # Stack all gradient norms into a single tensor, then compute on GPU
+            # grad_norms_tensor = torch.stack([
+            #     p.grad.data.norm(2) 
+            #     for p in model.parameters() 
+            #     if p.grad is not None
+            # ])
+            # total_norm = torch.norm(grad_norms_tensor, 2).item()  # Single GPU→CPU sync
+            # 
+            # # Track gradient norm
+            # grad_norms.append(total_norm)
+            # 
+            # # Check if clipping will occur
+            # gradient_clip_threshold = config['training']['gradient_clip']
+            # if total_norm > gradient_clip_threshold:
+            #     clip_count += 1
+            # 
+            # # Fixed-threshold gradient clipping
+            # torch.nn.utils.clip_grad_norm_(
+            #     model.parameters(), 
+            #     gradient_clip_threshold
+            # )
+            # ═══════════════════════════════════════════════════════════════
             
             scaler.step(optimizer)
             scaler.update()
@@ -527,6 +574,24 @@ def main(args):
     precision_type = config['training'].get('precision_type', 'fp16')
     scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
     
+    # Parameters:
+    # - alpha=0.97: EMA smoothing factor (higher = slower adaptation)
+    # - z_thresh=2.5: Z-score threshold for spike detection
+    # - max_grad_norm: Hard cap from config 
+    # - warmup_steps=25: Steps to collect gradient statistics before EMA init
+    # - mode="zscore": Use z-score based adaptive clipping
+    # - clip_option="adaptive_scaling": Dynamically scale threshold based on spike severity
+    # - clip_factor=1.0: Threshold multiplier (0.5-0.9 for aggressive clipping)
+    zclip = ZClip(
+        mode="zscore",                                 # Adaptive mode
+        alpha=0.97,                                    # EMA smoothing factor
+        z_thresh=2.5,                                  # Spike detection threshold
+        max_grad_norm=config['training']['gradient_clip'],  # Hard cap (15.0)
+        warmup_steps=25,                               # EMA initialization steps
+        clip_option="adaptive_scaling",                # Dynamic threshold computation
+        clip_factor=1.0                                # Standard clipping (1.0 = default)
+    )
+    
     if use_mixed_precision:
         print(f"\nMixed precision training enabled: {precision_type.upper()}")
         if precision_type == 'bf16':
@@ -575,7 +640,7 @@ def main(args):
         
         # Train
         train_loss, losses_dict, grad_stats = train_epoch(
-            model, train_loader, optimizer, scaler, config, epoch, writer, device
+            model, train_loader, optimizer, scaler, zclip, config, epoch, writer, device
         )
         
         # Validate - use config parameter
