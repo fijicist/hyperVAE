@@ -14,17 +14,29 @@ Key Features:
 4. **EEC Computation**: Calculates 2-point and n-point Energy-Energy Correlators
 5. **Graph Construction**: Builds fully-connected particle graphs with edge features
 6. **Hyperedges**: Optional n-point hyperedges for higher-order correlations
-7. **Memory Optimization**: Batch saving for large datasets (every 85k graphs)
+7. **Line Graphs**: Automatically generates line graphs (edges-as-nodes) after normalization
+8. **Memory Optimization**: Batch saving for large datasets (every 85k graphs)
 
 Output Format:
 --------------
-PyG Data objects with:
+Saved .pt files contain a dictionary with:
+- `graphs`: List of PyG Data objects (particle graphs)
+- `line_graphs`: List of PyG Data objects (line graphs with edges-as-nodes)
+- `metadata`: Dictionary containing normalization statistics
+
+Each particle graph (in `graphs`) contains:
 - `x`: Node features (normalized E, px, py, pz)
 - `edge_index`: Fully-connected adjacency (all particle pairs)
 - `edge_attr`: Edge features (2pt_EEC, ln_delta, ln_k_T, ln_z, ln_m2)
 - `hyperedge_index`: N-point particle combinations (if enabled)
 - `hyperedge_attr`: N-point EEC features (if enabled)
 - `y`: Jet-level labels (type, pt, eta, mass)
+
+Each line graph (in `line_graphs`) contains:
+- `x`: Node features (copied from edge_attr of corresponding particle graph)
+- `edge_index`: Line graph adjacency (edges sharing nodes in original graph)
+
+Metadata contains:
 - `particle_norm_stats`: Normalization statistics for particles
 - `jet_norm_stats`: Normalization statistics for jet features
 - `edge_norm_stats`: Normalization statistics for edge features
@@ -109,6 +121,7 @@ from jetnet.datasets import JetNet
 import time 
 import networkx as nx
 from torch_geometric.utils import to_networkx
+from torch_geometric.transforms import LineGraph
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -120,10 +133,10 @@ GRAPH_CONSTRUCTION_CONFIG = {
     'output_dir': './data/real/',
     
     # Graph structure (typically ['fully_connected'])
-    'graph_structures': ['fully_connected'],
+    'graph_structures': ['connected'],
     
     # Number of jets to process
-    'N': 20000,
+    'N': 10,
     
     # Dataset source: 'jetnet' or 'energyflow'
     'dataset': 'jetnet',
@@ -691,6 +704,85 @@ def _construct_particle_graphs_pyg(
             print(f'  ✓ Total edges processed: {edge_idx}')
             print(f'  ✓ Normalization statistics stored in edge_norm_stats with keys: {list(edge_norm_stats.keys())}')
             print(f'  ✓ All graphs updated with complete edge_norm_stats dictionary')
+            
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # Generate Line Graphs (edges-as-nodes) After Normalization
+            # ═══════════════════════════════════════════════════════════════════════════════
+            print(f'\n  Generating line graphs for {len(saved_filenames)} saved file(s)...')
+            line_graph_transform = LineGraph(force_directed=False)
+            
+            for filename in tqdm.tqdm(saved_filenames, desc=f'  Generating line graphs: {graph_key}'):
+                # Load the saved data (already normalized)
+                saved_data = torch.load(filename)
+                
+                # Handle both old format (list) and new format (dict)
+                if isinstance(saved_data, dict):
+                    graphs = saved_data['graphs']
+                    metadata = saved_data.get('metadata', {
+                        'particle_norm_stats': particle_norm_stats,
+                        'jet_norm_stats': jet_norm_stats,
+                        'edge_norm_stats': edge_norm_stats,
+                        'hyperedge_norm_stats': hyperedge_norm_stats
+                    })
+                else:
+                    # Old format: just a list of graphs
+                    graphs = saved_data
+                    metadata = {
+                        'particle_norm_stats': particle_norm_stats,
+                        'jet_norm_stats': jet_norm_stats,
+                        'edge_norm_stats': edge_norm_stats,
+                        'hyperedge_norm_stats': hyperedge_norm_stats
+                    }
+                
+                # Generate line graph for each particle graph
+                line_graph_list = []
+                for graph in graphs:
+                    if hasattr(graph, 'edge_attr') and graph.edge_attr is not None and graph.edge_attr.numel() > 0:
+                        # Create temporary data object for line graph transform
+                        tmp = torch_geometric.data.Data(
+                            x=graph.x,
+                            edge_index=graph.edge_index,
+                            edge_attr=graph.edge_attr
+                        )
+                        # Apply line graph transform
+                        lg = line_graph_transform(tmp)
+                        # Store only x and edge_index to minimize disk size
+                        lg_minimal = torch_geometric.data.Data(
+                            x=lg.x,
+                            edge_index=lg.edge_index
+                        )
+                    else:
+                        # Empty graph: create empty line graph
+                        edge_feat_dim = graph.edge_attr.size(1) if hasattr(graph, 'edge_attr') and graph.edge_attr is not None else 0
+                        lg_minimal = torch_geometric.data.Data(
+                            x=torch.empty((0, edge_feat_dim), dtype=torch.float32),
+                            edge_index=torch.empty((2, 0), dtype=torch.long)
+                        )
+                    line_graph_list.append(lg_minimal)
+                    del lg_minimal  # Free memory immediately
+                    if hasattr(graph, 'edge_attr') and graph.edge_attr is not None and graph.edge_attr.numel() > 0:
+                        del tmp, lg
+                
+                # Verification: check first graph in shard
+                if len(line_graph_list) > 0 and len(graphs) > 0:
+                    if hasattr(graphs[0], 'edge_attr') and graphs[0].edge_attr is not None and graphs[0].edge_attr.numel() > 0:
+                        assert line_graph_list[0].x.size(0) == graphs[0].edge_attr.size(0), \
+                            f"Line graph mismatch: expected {graphs[0].edge_attr.size(0)} nodes, got {line_graph_list[0].x.size(0)}"
+                    assert len(line_graph_list) == len(graphs), \
+                        f"Line graph count mismatch: expected {len(graphs)}, got {len(line_graph_list)}"
+                
+                # Save updated data with line graphs
+                torch.save({
+                    'graphs': graphs,
+                    'line_graphs': line_graph_list,
+                    'metadata': metadata
+                }, filename)
+                
+                # Clean up memory
+                del line_graph_list, graphs
+                gc.collect()
+            
+            print(f'  ✓ Line graphs generated and saved for {graph_key}.')
     print('Graph construction complete.')
 
 
