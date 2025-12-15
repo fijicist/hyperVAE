@@ -53,8 +53,10 @@ model:
         activation: "gelu"      # GELU activation (standard for transformers)
         num_hidden_layers: 2   # MLP depth in each block
     
-    # Edge encoding (MLP layers with residual connections)
-    edge_layers: 3            # Number of MLP layers for edges
+    # Edge encoding (GATv2Conv on precomputed line graphs)
+    edge_gat_layers: 3        # Number of GATv2Conv layers for line graph processing
+    edge_gat_heads: 8         # Number of attention heads per GAT layer (edge_hidden must be divisible by this)
+    edge_layers: 3            # Number of MLP layers for edges (deprecated, kept for compatibility)
     
     # Hyperedge encoding (MLP layers with residual connections)
     hyperedge_layers: 3       # Number of MLP layers for hyperedges

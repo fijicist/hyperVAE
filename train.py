@@ -168,7 +168,7 @@ from tqdm import tqdm
 import argparse
 from zclip import ZClip
 
-from data.bipartite_dataset import BipartiteJetDataset, collate_bipartite_batch, create_train_val_test_split
+from data.bipartite_dataset import BipartiteJetDataset, collate_bipartite_batch, collate_bipartite_batch_with_line_graphs, create_train_val_test_split
 from models.hypervae import BipartiteHyperVAE
 
 
@@ -202,8 +202,11 @@ def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, 
     dtype = torch.bfloat16 if precision_type == 'bf16' else torch.float16
     
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
-    for i, batch in enumerate(pbar):
-        batch = batch.to(device)
+    for i, batch_data in enumerate(pbar):
+        # Unpack both batches
+        batch_particles, batch_edges = batch_data
+        batch_particles = batch_particles.to(device)
+        batch_edges = batch_edges.to(device) if batch_edges is not None else None
         
         # Gumbel temperature annealing from config
         initial_temp = config['training'].get('initial_temperature', 5.0)
@@ -216,8 +219,8 @@ def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, 
         
         # Mixed precision training with configurable dtype
         with torch.cuda.amp.autocast(enabled=use_mixed_precision, dtype=dtype):
-            output = model(batch, temperature=temperature)
-            losses = model.compute_loss(batch, output, epoch=epoch)
+            output = model(batch_particles, batch_edges, temperature=temperature)
+            losses = model.compute_loss(batch_particles, output, epoch=epoch, batch_edges=batch_edges)
             loss = losses['total'] / accumulation_steps
         
         # NaN detection
@@ -415,13 +418,16 @@ def validate(model, loader, config, epoch, writer, device):
     val_temperature = config['training'].get('final_temperature', 0.5)
     
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Validation"):
-            batch = batch.to(device)
+        for batch_data in tqdm(loader, desc="Validation"):
+            # Unpack both batches
+            batch_particles, batch_edges = batch_data
+            batch_particles = batch_particles.to(device)
+            batch_edges = batch_edges.to(device) if batch_edges is not None else None
             
             # Use mixed precision for validation too
             with torch.cuda.amp.autocast(enabled=use_mixed_precision, dtype=dtype):
-                output = model(batch, temperature=val_temperature)
-                losses = model.compute_loss(batch, output, epoch=epoch)
+                output = model(batch_particles, batch_edges, temperature=val_temperature)
+                losses = model.compute_loss(batch_particles, output, epoch=epoch, batch_edges=batch_edges)
             
             total_loss += losses['total'].item() if isinstance(losses['total'], torch.Tensor) else losses['total']
             for key in losses_dict.keys():
@@ -503,8 +509,8 @@ def main(args):
     
     # Create custom collate function that adds normalization statistics
     def collate_with_stats(data_list):
-        """Wrapper around collate_bipartite_batch that adds normalization statistics"""
-        batch = collate_bipartite_batch(data_list)
+        """Wrapper around collate_bipartite_batch_with_line_graphs that adds normalization statistics"""
+        batch_particles, batch_edges = collate_bipartite_batch_with_line_graphs(data_list)
         
         # Get the base dataset (unwrap if it's a Subset)
         base_dataset = train_dataset
@@ -513,15 +519,15 @@ def main(args):
         
         # Attach normalization statistics from dataset to batch
         if hasattr(base_dataset, 'particle_norm_stats') and base_dataset.particle_norm_stats is not None:
-            batch.particle_norm_stats = base_dataset.particle_norm_stats
+            batch_particles.particle_norm_stats = base_dataset.particle_norm_stats
         if hasattr(base_dataset, 'jet_norm_stats') and base_dataset.jet_norm_stats is not None:
-            batch.jet_norm_stats = base_dataset.jet_norm_stats
+            batch_particles.jet_norm_stats = base_dataset.jet_norm_stats
         if hasattr(base_dataset, 'edge_norm_stats') and base_dataset.edge_norm_stats is not None:
-            batch.edge_norm_stats = base_dataset.edge_norm_stats
+            batch_particles.edge_norm_stats = base_dataset.edge_norm_stats
         if hasattr(base_dataset, 'hyperedge_norm_stats') and base_dataset.hyperedge_norm_stats is not None:
-            batch.hyperedge_norm_stats = base_dataset.hyperedge_norm_stats
+            batch_particles.hyperedge_norm_stats = base_dataset.hyperedge_norm_stats
         
-        return batch
+        return batch_particles, batch_edges
     
     # Create loaders
     train_loader = DataLoader(

@@ -101,6 +101,9 @@ class BipartiteJetDataset(Dataset):
         self.edge_norm_stats = None
         self.hyperedge_norm_stats = None
         
+        # Line graphs (edges-as-nodes representation)
+        self.line_graphs = None
+        
         if generate_dummy:
             self.data = self._generate_dummy_data(num_samples=num_samples)
             # Extract norm_stats from first dummy sample (they're all the same)
@@ -127,8 +130,9 @@ class BipartiteJetDataset(Dataset):
         
         # Extract graphs and metadata
         if isinstance(loaded_data, dict):
-            # New format: {'graphs': [...], 'metadata': {...}}
+            # New format: {'graphs': [...], 'line_graphs': [...], 'metadata': {...}}
             data_list = loaded_data['graphs']
+            self.line_graphs = loaded_data.get('line_graphs', None)
             metadata = loaded_data.get('metadata', {})
             
             # Extract normalization statistics from metadata (global, not per-graph)
@@ -145,9 +149,12 @@ class BipartiteJetDataset(Dataset):
                 print(f"Extracted edge normalization statistics from metadata")
             if self.hyperedge_norm_stats:
                 print(f"Extracted hyperedge normalization statistics from metadata")
+            if self.line_graphs:
+                print(f"Loaded {len(self.line_graphs)} line graphs (edges-as-nodes)")
         else:
             # Old format: just a list of graphs (backward compatibility)
             data_list = loaded_data
+            self.line_graphs = None  # Old format doesn't have line graphs
             
             # For old format, extract stats from first graph if available
             if len(data_list) > 0:
@@ -168,6 +175,11 @@ class BipartiteJetDataset(Dataset):
         
         if not isinstance(data_list, list):
             raise ValueError(f"Expected list of Data objects, got {type(data_list)}")
+        
+        # Validate line graphs if present
+        if self.line_graphs is not None:
+            if len(self.line_graphs) != len(data_list):
+                raise ValueError(f"Line graphs length {len(self.line_graphs)} != graphs length {len(data_list)}")
         
         print(f"Loaded {len(data_list)} jets")
         
@@ -368,7 +380,7 @@ class BipartiteJetDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx):
-        """Return PyG Data object matching graph_constructor.py format"""
+        """Return (PyG Data object, line_graph) tuple matching graph_constructor.py format"""
         sample = self.data[idx]
         
         # Create data object with field names matching graph_constructor.py
@@ -391,6 +403,9 @@ class BipartiteJetDataset(Dataset):
             n_hyperedges=torch.tensor([sample['n_hyperedges']])
         )
         
+        # Get line graph if available
+        line_graph = self.line_graphs[idx] if self.line_graphs is not None else None
+        
         # Add normalization statistics if present (needed for loss computation)
         if 'particle_norm_stats' in sample:
             data.particle_norm_stats = sample['particle_norm_stats']
@@ -401,24 +416,68 @@ class BipartiteJetDataset(Dataset):
         if 'hyperedge_norm_stats' in sample:
             data.hyperedge_norm_stats = sample['hyperedge_norm_stats']
         
-        return data
+        return data, line_graph
 
 
 def collate_bipartite_batch(data_list):
     """
-    Custom collate function for bipartite graphs.
+    Custom collate function for bipartite graphs (backward compatibility).
     
     Note: Normalization statistics are added in train.py via a wrapper function
     that accesses the dataset object directly.
     
     Args:
-        data_list: List of PyG Data objects
+        data_list: List of PyG Data objects OR list of (Data, line_graph) tuples
     
     Returns:
-        PyG Batch object
+        PyG Batch object (or tuple of batches if line graphs present)
     """
-    batch = Batch.from_data_list(data_list)
-    return batch
+    # Handle both old format (list of Data) and new format (list of tuples)
+    if isinstance(data_list[0], tuple):
+        # New format: extract data and line graphs
+        data_only = [item[0] for item in data_list]
+        line_graphs = [item[1] for item in data_list]
+        batch = Batch.from_data_list(data_only)
+        
+        # Batch line graphs if present
+        if line_graphs[0] is not None:
+            batch_edges = Batch.from_data_list(line_graphs)
+            return batch, batch_edges
+        else:
+            return batch, None
+    else:
+        # Old format: just data objects
+        batch = Batch.from_data_list(data_list)
+        return batch
+
+
+def collate_bipartite_batch_with_line_graphs(data_list):
+    """
+    Custom collate function for bipartite graphs with line graphs.
+    
+    Args:
+        data_list: List of (PyG Data, line_graph Data) tuples
+    
+    Returns:
+        (batch_particles, batch_edges): Tuple of PyG Batch objects
+            - batch_particles: Batch of particle graphs
+            - batch_edges: Batch of line graphs (edges-as-nodes)
+    """
+    # Extract particle graphs and line graphs
+    particle_graphs = [item[0] for item in data_list]
+    line_graphs = [item[1] for item in data_list]
+    
+    # Batch particle graphs
+    batch_particles = Batch.from_data_list(particle_graphs)
+    
+    # Batch line graphs (if present)
+    if line_graphs[0] is not None:
+        batch_edges = Batch.from_data_list(line_graphs)
+    else:
+        # No line graphs: create empty batch with correct device
+        batch_edges = None
+    
+    return batch_particles, batch_edges
 
 
 def create_train_val_test_split(dataset, train_frac=0.8, val_frac=0.1, test_frac=0.1, seed=42):

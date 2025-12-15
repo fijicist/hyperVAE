@@ -211,12 +211,12 @@ class BipartiteHyperVAE(nn.Module):
         
         return z
     
-    def forward(self, batch, temperature=1.0, generate_all_features=None):
+    def forward(self, batch_particles, batch_edges=None, temperature=1.0, generate_all_features=None):
         """
         Full forward pass through VAE: Encode → Sample → Decode.
         
         Pipeline:
-        1. Encoder: particles → latent distribution q(z|x) = N(μ, σ²)
+        1. Encoder: particles + line graphs → latent distribution q(z|x) = N(μ, σ²)
         2. Sample: z ~ q(z|x) via reparameterization trick
         3. Decoder: z → reconstructed particles, edges, hyperedges
         
@@ -225,9 +225,13 @@ class BipartiteHyperVAE(nn.Module):
         - Inference: Only generate particles (edges/hyperedges optional)
         
         Args:
-            batch: PyTorch Geometric Batch object containing:
+            batch_particles: PyTorch Geometric Batch object containing:
                 - particle_x: [N_total_particles, 4] - particle 4-vectors
-                - edge_index: [2, N_edges] - bipartite connectivity
+                - edge_index: [2, N_edges] - bipartite connectivity (not used by encoder)
+            batch_edges: PyTorch Geometric Batch object (line graph) containing:
+                - x: [N_line_nodes, edge_features] - line graph node features
+                - edge_index: [2, N_line_edges] - line graph connectivity
+                - batch: [N_line_nodes] - batch assignment
                 - edge_attr: [N_edges, 5] - edge features
                 - hyperedge_x: [N_hyperedges, 2] - hyperedge features
                 - jet_type: [batch_size] - jet type labels (0=quark, 1=gluon, 2=top)
@@ -262,8 +266,8 @@ class BipartiteHyperVAE(nn.Module):
             >>> latent_codes = output['z']
         """
         # === ENCODING PHASE ===
-        # Encode particles to latent distribution parameters
-        mu, logvar = self.encoder(batch)
+        # Encode particles and line graphs to latent distribution parameters
+        mu, logvar = self.encoder(batch_particles, batch_edges)
         
         # === SAMPLING PHASE ===
         # Sample latent code via reparameterization trick
@@ -273,7 +277,7 @@ class BipartiteHyperVAE(nn.Module):
         # Generate reconstructions from latent code (particles only - decoder no longer outputs edges/hyperedges)
         output = self.decoder(
             z, 
-            batch.jet_type,  # Condition on jet type (quark/gluon/top)
+            batch_particles.jet_type,  # Condition on jet type (quark/gluon/top)
             temperature      # Controls sharpness of topology assignments
         )
         
@@ -285,7 +289,7 @@ class BipartiteHyperVAE(nn.Module):
         
         return output
     
-    def compute_loss(self, batch, output, epoch=0):
+    def compute_loss(self, batch_particles, output, epoch=0, batch_edges=None):
         """
         Compute total VAE loss: Reconstruction + KL Divergence + Distribution Matching + Physics Consistency.
         
@@ -331,8 +335,8 @@ class BipartiteHyperVAE(nn.Module):
             Distribution matching uses Wasserstein distance on observable features.
         """
         # Fix batch.y shape if needed (PyG concatenates [4] tensors into [batch_size*4])
-        if batch.y.dim() == 1 and hasattr(batch, 'num_graphs'):
-            batch.y = batch.y.view(batch.num_graphs, -1)  # [batch_size, 4]
+        if batch_particles.y.dim() == 1 and hasattr(batch_particles, 'num_graphs'):
+            batch_particles.y = batch_particles.y.view(batch_particles.num_graphs, -1)  # [batch_size, 4]
         
         losses = {}
         
@@ -340,7 +344,7 @@ class BipartiteHyperVAE(nn.Module):
         # Chamfer distance: Permutation-invariant set matching
         # Measures how well predicted particle set matches true particle set
         particle_loss = self._particle_reconstruction_loss(
-            batch, output['particle_features'], output['particle_mask']
+            batch_particles, output['particle_features'], output['particle_mask']
         )
         losses['particle'] = particle_loss
         
@@ -349,34 +353,34 @@ class BipartiteHyperVAE(nn.Module):
         if self.use_distribution_loss:
             if self.distribution_loss_type=='wasserstein':
                 distribution_loss = self._edge_hyperedge_wasserstein_loss(
-                    batch, output['particle_features'], output['particle_mask']
+                    batch_particles, output['particle_features'], output['particle_mask']
                 )
                 losses['edge_distribution'] = distribution_loss['edge']
                 losses['hyperedge_distribution'] = distribution_loss['hyperedge']
             elif self.distribution_loss_type=='mse':
                 distribution_loss = self._edge_hyperedge_mse_loss(
-                    batch, output['particle_features'], output['particle_mask']
+                    batch_particles, output['particle_features'], output['particle_mask']
                 )
                 losses['edge_distribution'] = distribution_loss['edge']
                 losses['hyperedge_distribution'] = distribution_loss['hyperedge']
         else:
-            losses['edge_distribution'] = torch.tensor(0.0, device=batch.x.device)
-            losses['hyperedge_distribution'] = torch.tensor(0.0, device=batch.x.device)
+            losses['edge_distribution'] = torch.tensor(0.0, device=batch_particles.x.device)
+            losses['hyperedge_distribution'] = torch.tensor(0.0, device=batch_particles.x.device)
         
         # === 3. JET FEATURE LOSS ===
         # Pass topology information for N_constituents prediction
-        jet_loss = self._jet_feature_loss(batch, output['jet_features'], output['topology'])
+        jet_loss = self._jet_feature_loss(batch_particles, output['jet_features'], output['topology'])
         losses['jet'] = jet_loss
         
         # === 4. LOCAL→GLOBAL PHYSICS CONSISTENCY LOSS ===
         # Enforces that generated particles sum to correct jet-level observables
         if self.use_consistency_loss:
             consistency_loss = self._local_global_consistency_loss(
-                batch, output['particle_features'], output['particle_mask']
+                batch_particles, output['particle_features'], output['particle_mask']
             )
             losses['consistency'] = consistency_loss
         else:
-            losses['consistency'] = torch.tensor(0.0, device=batch.x.device)
+            losses['consistency'] = torch.tensor(0.0, device=batch_particles.x.device)
         
         # === 5. KL DIVERGENCE ===
         kl_loss = self._kl_divergence(output['mu'], output['logvar'])

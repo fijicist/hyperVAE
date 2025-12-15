@@ -41,6 +41,7 @@ Used for VAE reparameterization: z = μ + σ * ε, where ε ~ N(0, I)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import GATv2Conv
 from .lgatr_wrapper import LGATrParticleEncoder
 
 
@@ -90,7 +91,7 @@ class BipartiteEncoder(nn.Module):
         else:
             self.particle_to_scalar = None
         
-        # 2. Edge encoder with residual connections
+        # 2. Edge encoder with GATv2Conv on line graphs
         edge_features = config.get('edge_features', 5)  # Configurable (default: 5)
         self.edge_embed = nn.Sequential(
             nn.Linear(edge_features, edge_hidden),
@@ -98,18 +99,24 @@ class BipartiteEncoder(nn.Module):
             nn.GELU()
         )
         
-        # Edge MLP layers with residual connections
-        self.edge_mlp = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(edge_hidden, edge_hidden * 2),
-                nn.LayerNorm(edge_hidden * 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(edge_hidden * 2, edge_hidden),
-                nn.LayerNorm(edge_hidden),  # Added LayerNorm for stability
-                nn.Dropout(dropout)
+        # Edge GATv2Conv layers for processing line graphs
+        num_edge_gat_layers = config['encoder'].get('edge_gat_layers', 3)
+        num_edge_gat_heads = config['encoder'].get('edge_gat_heads', 8)
+        
+        # Ensure edge_hidden is divisible by num_edge_gat_heads
+        assert edge_hidden % num_edge_gat_heads == 0, \
+            f"edge_hidden ({edge_hidden}) must be divisible by edge_gat_heads ({num_edge_gat_heads})"
+        
+        self.edge_gat_layers = nn.ModuleList([
+            GATv2Conv(
+                in_channels=edge_hidden,
+                out_channels=edge_hidden // num_edge_gat_heads,
+                heads=num_edge_gat_heads,
+                concat=True,  # Output dim = heads * out_channels = edge_hidden
+                dropout=dropout,
+                add_self_loops=True,
             )
-            for _ in range(config['encoder'].get('edge_layers', config['encoder'].get('edge_transformer_layers', 3)))
+            for _ in range(num_edge_gat_layers)
         ])
         
         # 3. Hyperedge encoder (memory-efficient - no self-attention for large hyperedge sets)
@@ -197,35 +204,39 @@ class BipartiteEncoder(nn.Module):
         self.mu_proj = nn.Linear(latent_dim * 2, latent_dim)
         self.logvar_proj = nn.Linear(latent_dim * 2, latent_dim)
     
-    def forward(self, batch):
+    def forward(self, batch_particles, batch_edges):
         """
         Args:
-            batch: PyG Batch object with:
+            batch_particles: PyG Batch object with:
                 - particle_x: [N_particles, 4] - 4-vectors [E, px, py, pz]
                 - hyperedge_x: [N_hyperedges, 1 or 2]
-                - edge_attr: [N_edges, 5]
-                - edge_index: [2, N_edges]
+                - edge_attr: [N_edges, 5] (not used, kept for compatibility)
+                - edge_index: [2, N_edges] (not used, kept for compatibility)
                 - batch: Batch assignment
+            batch_edges: PyG Batch object (line graph) with:
+                - x: [N_line_nodes, edge_features] - Line graph node features (original edge_attr)
+                - edge_index: [2, N_line_edges] - Line graph connectivity
+                - batch: [N_line_nodes] - Batch assignment for line graph nodes
         """
         # 1. Encode particles with official L-GATr
         # Need to convert PyG flat format [N_particles, 4] to batched [batch_size, max_particles, 4]
         
         # Create particle batch index first to determine structure
-        particle_batch = self._create_particle_batch(batch)
-        batch_size = batch.num_graphs
+        particle_batch = self._create_particle_batch(batch_particles)
+        batch_size = batch_particles.num_graphs
         
         # Find max particles in this batch for padding
-        n_particles_list = batch.n_particles.tolist()
+        n_particles_list = batch_particles.n_particles.tolist()
         max_particles = max(n_particles_list)
         
         # Reshape to batched format with padding
-        device = batch.x.device
+        device = batch_particles.x.device
         batched_fourmomenta = torch.zeros(batch_size, max_particles, 4, device=device)
         batched_mask = torch.zeros(batch_size, max_particles, dtype=torch.bool, device=device)
         
         particle_idx = 0
         for i, n_p in enumerate(n_particles_list):
-            batched_fourmomenta[i, :n_p] = batch.x[particle_idx:particle_idx + n_p]
+            batched_fourmomenta[i, :n_p] = batch_particles.x[particle_idx:particle_idx + n_p]
             batched_mask[i, :n_p] = True
             particle_idx += n_p
         
@@ -249,44 +260,30 @@ class BipartiteEncoder(nn.Module):
         # Pool particles per graph
         particle_pooled = self._global_mean_pool(particle_x, particle_batch)
         
-        # 2. Encode edges with residual connections (if present)
-        if batch.edge_attr.size(0) > 0:
-            # Embed edge features
-            edge_x = self.edge_embed(batch.edge_attr)  # [E, edge_hidden]
+        # 2. Encode edges using GATv2Conv on line graphs
+        if batch_edges is not None and batch_edges.x.size(0) > 0:
+            # Embed line graph node features (original edge_attr)
+            edge_x = self.edge_embed(batch_edges.x)  # [N_line_nodes, edge_hidden]
             
-            # Apply MLP layers with residual connections
-            for layer in self.edge_mlp:
-                edge_x = edge_x + layer(edge_x)  # Residual connection
+            # Apply GATv2Conv layers on line graph
+            for gat_layer in self.edge_gat_layers:
+                edge_x = gat_layer(edge_x, batch_edges.edge_index)
             
-            # Mean pooling of edges per graph
-            edge_pooled = torch.zeros(batch.num_graphs, self.config['edge_hidden'], device=edge_x.device)
-            cumulative_particles = 0
-            cumulative_edges = 0
-            
-            for i in range(batch.num_graphs):
-                n_particles = batch.n_particles[i].item()
-                # Count edges in this graph
-                mask = (batch.edge_index[0] >= cumulative_particles) & (batch.edge_index[0] < cumulative_particles + n_particles)
-                n_edges = mask.sum().item()
-                
-                if n_edges > 0:
-                    graph_edges = edge_x[cumulative_edges:cumulative_edges + n_edges]
-                    edge_pooled[i] = graph_edges.mean(dim=0)
-                    cumulative_edges += n_edges
-                
-                cumulative_particles += n_particles
+            # Global mean pooling per graph using batch assignment
+            edge_pooled = self._global_mean_pool(edge_x, batch_edges.batch)
         else:
-            edge_pooled = torch.zeros(particle_pooled.size(0), self.config['edge_hidden'], 
-                                     device=particle_x.device)
+            # No edges: create zero tensor
+            edge_pooled = torch.zeros(batch_particles.num_graphs, self.config['edge_hidden'], 
+                                     device=device)
         
         # 3. Encode hyperedges (no self-attention to save memory)
-        hyperedge_x = self.hyperedge_embed(batch.hyperedge_attr)
+        hyperedge_x = self.hyperedge_embed(batch_particles.hyperedge_attr)
         for layer in self.hyperedge_mlp:
             # Residual connection
             hyperedge_x = hyperedge_x + layer(hyperedge_x)
         
         # Create batch assignment for hyperedges
-        hyperedge_batch = self._create_hyperedge_batch(batch)
+        hyperedge_batch = self._create_hyperedge_batch(batch_particles)
         hyperedge_pooled = self._global_mean_pool(hyperedge_x, hyperedge_batch)
         
         # 4. Encode jet-level features with residual connections
@@ -297,9 +294,9 @@ class BipartiteEncoder(nn.Module):
         
         # PyG concatenates y tensors during batching: [4, 4, 4, ...] -> [batch_size*4]
         # Reshape to [batch_size, 4] for proper indexing
-        y = batch.y
+        y = batch_particles.y
         if y.dim() == 1:
-            batch_size = batch.num_graphs
+            batch_size = batch_particles.num_graphs
             y = y.view(batch_size, -1)  # [batch_size, 4]
         
         jet_features = torch.stack([
@@ -318,6 +315,12 @@ class BipartiteEncoder(nn.Module):
         edge_pooled = self.edge_pool_norm(edge_pooled)
         hyperedge_pooled = self.hyperedge_pool_norm(hyperedge_pooled)
         jet_pooled = self.jet_pool_norm(jet_x)
+        
+        # Shape consistency check
+        assert edge_pooled.shape[0] == batch_particles.num_graphs, \
+            f"Edge pooled batch size {edge_pooled.shape[0]} != particle batch size {batch_particles.num_graphs}"
+        assert edge_pooled.shape[1] == self.config['edge_hidden'], \
+            f"Edge pooled dim {edge_pooled.shape[1]} != edge_hidden {self.config['edge_hidden']}"
         
         # 6. Cross-attention at pool level to refine particle_pooled
         # Cross-attend particles to hyperedges (residual)
@@ -351,13 +354,13 @@ class BipartiteEncoder(nn.Module):
         
         return mu, logvar
     
-    def _create_particle_batch(self, batch):
+    def _create_particle_batch(self, batch_particles):
         """Create batch index for particles only"""
         particle_batch = []
-        for i in range(batch.num_graphs):
-            n_particles = batch.n_particles[i].item()
+        for i in range(batch_particles.num_graphs):
+            n_particles = batch_particles.n_particles[i].item()
             particle_batch.extend([i] * n_particles)
-        return torch.tensor(particle_batch, device=batch.x.device)
+        return torch.tensor(particle_batch, device=batch_particles.x.device)
     
     def _global_mean_pool(self, x, batch):
         """Global mean pooling"""
@@ -368,17 +371,17 @@ class BipartiteEncoder(nn.Module):
         count.scatter_add_(0, batch, torch.ones_like(batch, dtype=x.dtype))
         return out / count.unsqueeze(1).clamp(min=1)
     
-    def _create_hyperedge_batch(self, batch):
+    def _create_hyperedge_batch(self, batch_particles):
         """Create batch assignment for hyperedges"""
         hyperedge_batch = []
-        for i in range(batch.num_graphs):
-            n_hyperedges = batch.n_hyperedges[i].item()
+        for i in range(batch_particles.num_graphs):
+            n_hyperedges = batch_particles.n_hyperedges[i].item()
             hyperedge_batch.extend([i] * n_hyperedges)
-        return torch.tensor(hyperedge_batch, device=batch.x.device)
+        return torch.tensor(hyperedge_batch, device=batch_particles.x.device)
 
 
 class BipartiteCrossAttention(nn.Module):
-    """Cross-attention between particle and hyperedge representations (IMPROVED)"""
+    """Cross-attention between particle and hyperedge representations"""
     
     def __init__(self, particle_dim, hyperedge_dim, num_heads=4, dropout=0.1):
         super().__init__()
@@ -420,7 +423,7 @@ class BipartiteCrossAttention(nn.Module):
 
 
 if __name__ == "__main__":
-    from data.bipartite_dataset import BipartiteJetDataset, collate_bipartite_batch
+    from data.bipartite_dataset import BipartiteJetDataset, collate_bipartite_batch_with_line_graphs
     from torch.utils.data import DataLoader
     
     # Test encoder
@@ -432,19 +435,20 @@ if __name__ == "__main__":
         'encoder': {
             'cross_attention_heads': 4,  # For bipartite cross-attention
             'particle_lgat_layers': 3,
-            'edge_transformer_layers': 2,
+            'edge_gat_layers': 3,  # Line graph GAT layers
+            'edge_gat_heads': 8,   # Line graph GAT heads
             'hyperedge_lgat_layers': 2,
             'dropout': 0.1
         }
     }
     
     dataset = BipartiteJetDataset(generate_dummy=True)
-    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_bipartite_batch)
-    batch = next(iter(loader))
+    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_bipartite_batch_with_line_graphs)
+    batch_particles, batch_edges = next(iter(loader))
     
     encoder = BipartiteEncoder(config)
-    mu, logvar = encoder(batch)
+    mu, logvar = encoder(batch_particles, batch_edges)
     
-    print(f"Batch size: {batch.num_graphs}")
+    print(f"Batch size: {batch_particles.num_graphs}")
     print(f"Mu shape: {mu.shape}")
     print(f"Logvar shape: {logvar.shape}")
