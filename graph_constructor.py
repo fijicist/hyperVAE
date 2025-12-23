@@ -136,7 +136,7 @@ GRAPH_CONSTRUCTION_CONFIG = {
     'graph_structures': ['fully_connected_with_line_graphs'],
     
     # Number of jets to process
-    'N': 30000,
+    'N': 500,
     
     # Dataset source: 'jetnet' or 'energyflow'
     'dataset': 'jetnet',
@@ -475,6 +475,63 @@ def _construct_particle_graphs_pyg(
 
         print("  Normalization of node features done.")
 
+        # ───────────────────────────────────────────────────────────────────────
+        # Plot normalized particle and jet features for quick inspection
+        # ───────────────────────────────────────────────────────────────────────
+        try:
+            # Aggregate normalized particle features across all jets
+            norm_E = np.concatenate([arr[:, 0] for arr in X]) if len(X) > 0 else np.array([])
+            norm_px = np.concatenate([arr[:, 1] for arr in X]) if len(X) > 0 else np.array([])
+            norm_py = np.concatenate([arr[:, 2] for arr in X]) if len(X) > 0 else np.array([])
+            norm_pz = np.concatenate([arr[:, 3] for arr in X]) if len(X) > 0 else np.array([])
+
+            # Aggregate normalized jet-level features
+            norm_pt = np.array([y[i][1] for i in range(len(y))])
+            norm_eta = np.array([y[i][2] for i in range(len(y))])
+            norm_mass = np.array([y[i][3] for i in range(len(y))])
+
+            # Ensure output directory for plots exists
+            plots_dir = os.path.join('plots', 'normalized_dataset_features')
+            os.makedirs(plots_dir, exist_ok=True)
+
+            fig, axs = plt.subplots(2, 4, figsize=(18, 8))
+
+            # Row 0: Particle feature histograms
+            particle_arrays = [norm_E, norm_px, norm_py, norm_pz]
+            particle_labels = ['E (norm)', 'px (norm)', 'py (norm)', 'pz (norm)']
+            for j, (arr, label) in enumerate(zip(particle_arrays, particle_labels)):
+                if arr.size > 0:
+                    # Use 0.5 to 99.5 percentile range for better visualization
+                    vmin, vmax = np.percentile(arr, [0.5, 99.5])
+                    axs[0, j].hist(arr, bins=100, range=(vmin, vmax), color='steelblue', histtype='step', linewidth=1.5)
+                axs[0, j].set_title(label)
+
+            # Row 1: Jet feature histograms
+            jet_arrays = [norm_pt, norm_eta, norm_mass]
+            jet_labels = ['jet pt (norm)', 'jet eta (norm)', 'jet mass (norm)']
+            for j, (arr, label) in enumerate(zip(jet_arrays, jet_labels)):
+                # Use 0.5 to 99.5 percentile range for better visualization
+                vmin, vmax = np.percentile(arr, [0.5, 99.5])
+                axs[1, j].hist(arr, bins=100, range=(vmin, vmax), color='tomato', histtype='step', linewidth=1.5)
+                axs[1, j].set_title(label)
+
+            # Hide unused subplot
+            axs[1, 3].axis('off')
+
+            for ax in axs.flatten():
+                ax.grid(True, ls='--', alpha=0.3)
+
+            plt.tight_layout()
+            plot_path = os.path.join(plots_dir, 'normalized_graph_features.png')
+            plt.savefig(plot_path, dpi=120)
+            plt.close(fig)
+            print(f"  Saved normalized feature plots to {plot_path}")
+
+            # Free temporary arrays
+            del norm_E, norm_px, norm_py, norm_pz, norm_pt, norm_eta, norm_mass
+            gc.collect()
+        except Exception as e:
+            print(f"  Warning: plotting normalized features failed: {e}")
 
         # Optional: one-hot encode jet types (currently disabled)
         # y[:, 0] = OneHotEncodeType(y)[:, 0]
@@ -585,6 +642,10 @@ def _construct_particle_graphs_pyg(
         all_edge_features = []
         saved_filenames = []
         graph_list = []
+        
+        # Initialize feature collection for plotting (all graphs)
+        sampled_edge_features = []  # Will collect normalized edge features
+        sampled_hyperedge_features = []  # Will collect normalized hyperedge features
 
         args = [(x, y[i], old_X[i], particle_norm_stats, jet_norm_stats, edge_norm_stats, hyperedge_norm_stats) for i, x in enumerate(X)] # Using old_X to store the old features
         for i, arg in enumerate(tqdm.tqdm(args, desc=f'  Constructing PyG graphs: {graph_key}', total=len(args))):
@@ -704,6 +765,98 @@ def _construct_particle_graphs_pyg(
             print(f'  ✓ Total edges processed: {edge_idx}')
             print(f'  ✓ Normalization statistics stored in edge_norm_stats with keys: {list(edge_norm_stats.keys())}')
             print(f'  ✓ All graphs updated with complete edge_norm_stats dictionary')
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # Collect all edge and hyperedge features for plotting (no sampling)
+            # ───────────────────────────────────────────────────────────────────────────
+            print(f'  Collecting all edge and hyperedge features for plotting...')
+            for filename in saved_filenames:
+                saved_data = torch.load(filename, map_location='cpu')
+                graphs = saved_data['graphs'] if isinstance(saved_data, dict) else saved_data
+                
+                # Vectorized collection: gather all edge_attr and hyperedge_attr at once
+                edge_attrs = [g.edge_attr.cpu().numpy() for g in graphs if hasattr(g, 'edge_attr') and g.edge_attr is not None]
+                hyperedge_attrs = [g.hyperedge_attr.cpu().numpy() for g in graphs if hasattr(g, 'hyperedge_attr') and g.hyperedge_attr is not None]
+                
+                sampled_edge_features.extend(edge_attrs)
+                sampled_hyperedge_features.extend(hyperedge_attrs)
+                
+                del saved_data, graphs, edge_attrs, hyperedge_attrs
+                gc.collect()
+            
+            print(f'    Collected {len(sampled_edge_features)} edge feature samples')
+            print(f'    Collected {len(sampled_hyperedge_features)} hyperedge feature samples')
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # Plot normalized edge and hyperedge features
+            # ───────────────────────────────────────────────────────────────────────────
+            if sampled_edge_features or sampled_hyperedge_features:
+                try:
+                    plots_dir = os.path.join('plots', 'normalized_dataset_features')
+                    os.makedirs(plots_dir, exist_ok=True)
+                    
+                    # Stack edge features: [2pt_EEC, ln_delta, ln_k_T, ln_z, ln_m2]
+                    if sampled_edge_features:
+                        stacked_edge_samples = np.vstack(sampled_edge_features)
+                        edge_feature_names = ['2pt_EEC (norm)', 'ln_delta (norm)', 'ln_k_T (norm)', 'ln_z (norm)', 'ln_m2 (norm)']
+                        
+                        n_edge_features = min(len(edge_feature_names), stacked_edge_samples.shape[1])
+                        fig_edge, axs_edge = plt.subplots(1, n_edge_features, figsize=(4*n_edge_features, 4))
+                        if n_edge_features == 1:
+                            axs_edge = [axs_edge]
+                        
+                        for j in range(n_edge_features):
+                            arr = stacked_edge_samples[:, j]
+                            if arr.size > 0:
+                                vmin, vmax = np.percentile(arr, [0.5, 99.5])
+                                axs_edge[j].hist(arr, bins=100, range=(vmin, vmax), color='green', histtype='step', linewidth=1.5)
+                            axs_edge[j].set_title(edge_feature_names[j])
+                            axs_edge[j].grid(True, ls='--', alpha=0.3)
+                        
+                        plt.tight_layout()
+                        edge_plot_path = os.path.join(plots_dir, 'normalized_edge_features.png')
+                        plt.savefig(edge_plot_path, dpi=120)
+                        plt.close(fig_edge)
+                        print(f'  Saved normalized edge feature plots to {edge_plot_path}')
+                        del stacked_edge_samples
+                    
+                    # Stack hyperedge features: [3pt_EEC, 4pt_EEC, ...] (normalized)
+                    if sampled_hyperedge_features:
+                        stacked_hyperedge_samples = np.vstack(sampled_hyperedge_features)
+                        n_hyperedge_features = stacked_hyperedge_samples.shape[1]
+                        
+                        # Determine hyperedge feature names from eec_prop
+                        hyperedge_feature_names = []
+                        for n_point in eec_prop[0]:
+                            if n_point > 2:
+                                hyperedge_feature_names.append(f'{n_point}pt_EEC (norm)')
+                        
+                        n_cols = min(n_hyperedge_features, len(hyperedge_feature_names))
+                        if n_cols > 0:
+                            fig_hyper, axs_hyper = plt.subplots(1, n_cols, figsize=(4*n_cols, 4))
+                            if n_cols == 1:
+                                axs_hyper = [axs_hyper]
+                            
+                            for j in range(n_cols):
+                                arr = stacked_hyperedge_samples[:, j]
+                                if arr.size > 0:
+                                    vmin, vmax = np.percentile(arr, [0.5, 99.5])
+                                    axs_hyper[j].hist(arr, bins=100, range=(vmin, vmax), color='purple', histtype='step', linewidth=1.5)
+                                axs_hyper[j].set_title(hyperedge_feature_names[j])
+                                axs_hyper[j].grid(True, ls='--', alpha=0.3)
+                            
+                            plt.tight_layout()
+                            hyper_plot_path = os.path.join(plots_dir, 'normalized_hyperedge_features.png')
+                            plt.savefig(hyper_plot_path, dpi=120)
+                            plt.close(fig_hyper)
+                            print(f'  Saved normalized hyperedge feature plots to {hyper_plot_path}')
+                        del stacked_hyperedge_samples
+                    
+                    # Clean up
+                    del sampled_edge_features, sampled_hyperedge_features
+                    gc.collect()
+                except Exception as e:
+                    print(f'  Warning: plotting normalized edge/hyperedge features failed: {e}')
             
             # ═══════════════════════════════════════════════════════════════════════════════
             # Generate Line Graphs (edges-as-nodes) After Normalization
