@@ -181,7 +181,9 @@ class BipartiteEncoder(nn.Module):
         self.jet_pool_norm = nn.LayerNorm(jet_hidden)
         
         # 7. Fusion and latent projection with pre-projection for residual
-        fusion_dim = particle_output_dim + hyperedge_hidden + edge_hidden + jet_hidden
+        # Add 3 dimensions for one-hot encoded jet type (quark/gluon/top)
+        jet_types = 3
+        fusion_dim = particle_output_dim + hyperedge_hidden + edge_hidden + jet_hidden + jet_types
         
         # Project fused features to latent_dim*2 for residual connection
         self.fusion_pre_proj = nn.Linear(fusion_dim, latent_dim * 2)
@@ -231,7 +233,7 @@ class BipartiteEncoder(nn.Module):
         
         # Reshape to batched format with padding
         device = batch_particles.x.device
-        batched_fourmomenta = torch.zeros(batch_size, max_particles, 4, device=device)
+        batched_fourmomenta = torch.zeros(batch_size, max_particles, 4, device=device, dtype=torch.float32)
         batched_mask = torch.zeros(batch_size, max_particles, dtype=torch.bool, device=device)
         
         particle_idx = 0
@@ -274,7 +276,7 @@ class BipartiteEncoder(nn.Module):
         else:
             # No edges: create zero tensor
             edge_pooled = torch.zeros(batch_particles.num_graphs, self.config['edge_hidden'], 
-                                     device=device)
+                                     device=device, dtype=torch.float32)
         
         # 3. Encode hyperedges (no self-attention to save memory)
         hyperedge_x = self.hyperedge_embed(batch_particles.hyperedge_attr)
@@ -331,12 +333,18 @@ class BipartiteEncoder(nn.Module):
         edge_attn = self.particle_edge_cross(particle_pooled, edge_pooled)
         particle_pooled = particle_pooled + edge_attn
         
-        # 7. Fusion with residual connection (now includes jet features)
-        fused = torch.cat([particle_pooled, edge_pooled, hyperedge_pooled, jet_pooled], dim=-1)
+        # 7. Extract and encode jet type for conditioning
+        # jet_type is already extracted in batch_particles.jet_type [batch_size]
+        jet_type = batch_particles.jet_type
+        # One-hot encode: [batch_size] -> [batch_size, 3]
+        jet_type_onehot = torch.nn.functional.one_hot(jet_type, num_classes=3).float()
+        
+        # 8. Fusion with residual connection (includes jet features AND jet type)
+        fused = torch.cat([particle_pooled, edge_pooled, hyperedge_pooled, jet_pooled, jet_type_onehot], dim=-1)
         fused_proj = self.fusion_pre_proj(fused)  # Project to latent_dim*2
         fused = fused_proj + self.fusion_mlp(fused_proj)  # Residual: preserve direct mapping
         
-        # 8. Latent parameters with normalization for stability
+        # 9. Latent parameters with normalization for stability
         fused = self.latent_norm(fused)  # Normalize before projection to prevent explosion
         mu = self.mu_proj(fused)
         logvar = self.logvar_proj(fused)
@@ -346,11 +354,25 @@ class BipartiteEncoder(nn.Module):
         mu = torch.clamp(mu, min=-10.0, max=10.0)
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         
-        # Additional safety: replace NaN with zeros (emergency fallback)
+        # DEBUG MODE: Crash fast on NaN instead of silently replacing with zeros
+        # This helps identify the first operation that goes non-finite
+        # Comment out these assertions if you need emergency fallback behavior
         if torch.isnan(mu).any():
-            mu = torch.where(torch.isnan(mu), torch.zeros_like(mu), mu)
+            raise RuntimeError(
+                f"NaN detected in encoder mu! This indicates BF16/FP16 numerical instability. "
+                f"Check: 1) Disable GradScaler for BF16, 2) Compute loss in FP32, 3) Reduce learning rate"
+            )
         if torch.isnan(logvar).any():
-            logvar = torch.where(torch.isnan(logvar), torch.zeros_like(logvar), logvar)
+            raise RuntimeError(
+                f"NaN detected in encoder logvar! This indicates BF16/FP16 numerical instability. "
+                f"Check: 1) Disable GradScaler for BF16, 2) Compute loss in FP32, 3) Reduce learning rate"
+            )
+        
+        # EMERGENCY FALLBACK (commented out - uncomment to silently replace NaNs):
+        # if torch.isnan(mu).any():
+        #     mu = torch.where(torch.isnan(mu), torch.zeros_like(mu), mu)
+        # if torch.isnan(logvar).any():
+        #     logvar = torch.where(torch.isnan(logvar), torch.zeros_like(logvar), logvar)
         
         return mu, logvar
     
@@ -360,7 +382,7 @@ class BipartiteEncoder(nn.Module):
         for i in range(batch_particles.num_graphs):
             n_particles = batch_particles.n_particles[i].item()
             particle_batch.extend([i] * n_particles)
-        return torch.tensor(particle_batch, device=batch_particles.x.device)
+        return torch.tensor(particle_batch, device=batch_particles.x.device, dtype=torch.long)
     
     def _global_mean_pool(self, x, batch):
         """Global mean pooling"""
@@ -377,7 +399,7 @@ class BipartiteEncoder(nn.Module):
         for i in range(batch_particles.num_graphs):
             n_hyperedges = batch_particles.n_hyperedges[i].item()
             hyperedge_batch.extend([i] * n_hyperedges)
-        return torch.tensor(hyperedge_batch, device=batch_particles.x.device)
+        return torch.tensor(hyperedge_batch, device=batch_particles.x.device, dtype=torch.long)
 
 
 class BipartiteCrossAttention(nn.Module):
