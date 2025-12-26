@@ -26,8 +26,10 @@ Key Features:
 -------------
 1. MIXED PRECISION (FP16/BF16):
    - FP16 (float16): Reduces memory by 2×, faster on Volta/Turing GPUs (V100, T4, RTX 20xx)
-   - BF16 (bfloat16): Better stability, recommended for Ampere+ GPUs (A100, RTX 30xx/40xx)
-   - Uses GradScaler to prevent underflow (FP16) or for consistency (BF16)
+     * Uses GradScaler to prevent gradient underflow
+   - BF16 (bfloat16): Better stability, wider dynamic range, recommended for Ampere+ GPUs (A100, RTX 30xx/40xx)
+     * Does NOT use GradScaler (wider exponent range doesn't need scaling)
+   - Loss computed in FP32 for numerical stability (KL/log/exp are sensitive)
    - Configure via: mixed_precision=true, precision_type="fp16" or "bf16"
 
 2. GRADIENT ACCUMULATION:
@@ -38,6 +40,7 @@ Key Features:
 3. GRADIENT CLIPPING (ZClip - Adaptive Method):
    - Uses ZClip: EMA-based adaptive gradient clipping
    - Dynamically adjusts clipping threshold based on gradient statistics
+   - Protected from non-finite gradients via finiteness check before ZClip
    - Automatically detects and mitigates gradient spikes (z-score > 2.5)
    - More stable than fixed-threshold clipping for high learning rates
    - Config: gradient_clip=15.0 sets hard cap, ZClip adapts within this limit
@@ -172,7 +175,7 @@ from data.bipartite_dataset import BipartiteJetDataset, collate_bipartite_batch,
 from models.hypervae import BipartiteHyperVAE
 
 
-def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, device):
+def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, device, use_scaler):
     """Train for one epoch"""
     model.train()
     
@@ -199,7 +202,12 @@ def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, 
     # Determine precision dtype
     precision_type = config['training'].get('precision_type', 'fp16')
     use_mixed_precision = config['training']['mixed_precision']
-    dtype = torch.bfloat16 if precision_type == 'bf16' else torch.float16
+    if precision_type == 'fp32':
+        dtype = torch.float32
+    elif precision_type ==  'bf16':
+        dtype = torch.bfloat16
+    else: 
+        dtype = torch.float16
     
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     for i, batch_data in enumerate(pbar):
@@ -218,8 +226,12 @@ def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, 
         temperature = max(final_temp, temperature)  # Clamp to final temp
         
         # Mixed precision training with configurable dtype
+        # Forward pass in mixed precision (big matmuls/attention)
         with torch.cuda.amp.autocast(enabled=use_mixed_precision, dtype=dtype):
             output = model(batch_particles, batch_edges, temperature=temperature)
+        
+        # Compute loss in FP32 for numerical stability (KL/log/exp are sensitive)
+        with torch.autocast(device_type="cuda", enabled=False):
             losses = model.compute_loss(batch_particles, output, epoch=epoch, batch_edges=batch_edges)
             loss = losses['total'] / accumulation_steps
         
@@ -253,14 +265,32 @@ def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, 
             optimizer.zero_grad()
             continue
         
-        # Backward with gradient scaling
-        scaler.scale(loss).backward()
+        # Backward with conditional gradient scaling (FP16 only)
+        if use_scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         # Gradient accumulation
         if (i + 1) % accumulation_steps == 0:
             
-            # Unscale gradients for ZClip (required for mixed precision)
-            scaler.unscale_(optimizer)
+            # Unscale gradients for ZClip (only for FP16)
+            if use_scaler:
+                scaler.unscale_(optimizer)
+            
+            # Check for non-finite gradients BEFORE ZClip to prevent corrupting its statistics
+            has_finite_grads = True
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    has_finite_grads = False
+                    print(f"\n⚠️  Non-finite gradient detected at epoch {epoch}, batch {i}. Skipping optimizer step.")
+                    break
+            
+            if not has_finite_grads:
+                optimizer.zero_grad(set_to_none=True)
+                if use_scaler:
+                    scaler.update()  # Let scaler reduce scale factor
+                continue
             
             # ZClip.step() performs:
             # 1. Compute total gradient norm across all parameters
@@ -322,8 +352,11 @@ def train_epoch(model, loader, optimizer, scaler, zclip, config, epoch, writer, 
             # )
             # ═══════════════════════════════════════════════════════════════
             
-            scaler.step(optimizer)
-            scaler.update()
+            if use_scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
         
         # Logging - accumulate on GPU to avoid sync (OPTIMIZED)
@@ -424,9 +457,12 @@ def validate(model, loader, config, epoch, writer, device):
             batch_particles = batch_particles.to(device)
             batch_edges = batch_edges.to(device) if batch_edges is not None else None
             
-            # Use mixed precision for validation too
+            # Use mixed precision for validation forward pass
             with torch.cuda.amp.autocast(enabled=use_mixed_precision, dtype=dtype):
                 output = model(batch_particles, batch_edges, temperature=val_temperature)
+            
+            # Compute loss in FP32 for consistency with training
+            with torch.autocast(device_type="cuda", enabled=False):
                 losses = model.compute_loss(batch_particles, output, epoch=epoch, batch_edges=batch_edges)
             
             total_loss += losses['total'].item() if isinstance(losses['total'], torch.Tensor) else losses['total']
@@ -575,10 +611,12 @@ def main(args):
         T_mult=2
     )
     
-    # Mixed precision scaler (works with both FP16 and BF16)
+    # Mixed precision scaler (ONLY for FP16, not BF16)
+    # BF16 has wider exponent range and doesn't need gradient scaling
     use_mixed_precision = config['training']['mixed_precision']
     precision_type = config['training'].get('precision_type', 'fp16')
-    scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
+    use_scaler = use_mixed_precision and (precision_type == 'fp16')  # Key fix: disable for BF16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
     
     # Parameters:
     # - alpha=0.97: EMA smoothing factor (higher = slower adaptation)
@@ -623,8 +661,8 @@ def main(args):
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
-            # Load scaler state if available
-            if 'scaler_state_dict' in checkpoint:
+            # Load scaler state if available (only for FP16)
+            if 'scaler_state_dict' in checkpoint and use_scaler:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
             print(f"✅ Resumed training from epoch {checkpoint['epoch']}")
@@ -646,7 +684,7 @@ def main(args):
         
         # Train
         train_loss, losses_dict, grad_stats = train_epoch(
-            model, train_loader, optimizer, scaler, zclip, config, epoch, writer, device
+            model, train_loader, optimizer, scaler, zclip, config, epoch, writer, device, use_scaler
         )
         
         # Validate - use config parameter
@@ -705,14 +743,17 @@ def main(args):
         # Save checkpoint
         save_every = config['training'].get('save_every', 20)
         if epoch % save_every == 0:
-            torch.save({
+            checkpoint_data = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
                 'config': config
-            }, os.path.join(args.save_dir, f'checkpoint_epoch{epoch}.pt'))
+            }
+            # Only save scaler state for FP16
+            if use_scaler:
+                checkpoint_data['scaler_state_dict'] = scaler.state_dict()
+            torch.save(checkpoint_data, os.path.join(args.save_dir, f'checkpoint_epoch{epoch}.pt'))
         
         # Learning rate scheduling
         scheduler.step()

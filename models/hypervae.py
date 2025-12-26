@@ -194,14 +194,21 @@ class BipartiteHyperVAE(nn.Module):
             We use log variance instead of variance directly for numerical stability.
             This prevents variance from becoming negative during training.
         """
-        # Convert log variance to standard deviation
-        std = torch.exp(0.5 * logvar)
+        # Convert log variance to standard deviation (force FP32 for stability)
+        # exp() is numerically sensitive and can overflow in BF16
+        mu_fp32 = mu.float()
+        logvar_fp32 = logvar.float()
+        std = torch.exp(0.5 * logvar_fp32)
         
         # Sample from standard normal
         eps = torch.randn_like(std)
         
         # Reparameterization: z = μ + σ * ε
-        z = mu + eps * std
+        z = mu_fp32 + eps * std
+        
+        # Convert back to original dtype if needed
+        if mu.dtype != torch.float32:
+            z = z.to(mu.dtype)
         
         # Optional: Add extra noise during training for regularization (variational dropout)
         # This can improve generalization by preventing overfitting to specific latent codes
@@ -364,8 +371,8 @@ class BipartiteHyperVAE(nn.Module):
                 losses['edge_distribution'] = distribution_loss['edge']
                 losses['hyperedge_distribution'] = distribution_loss['hyperedge']
         else:
-            losses['edge_distribution'] = torch.tensor(0.0, device=batch_particles.x.device)
-            losses['hyperedge_distribution'] = torch.tensor(0.0, device=batch_particles.x.device)
+            losses['edge_distribution'] = torch.tensor(0.0, device=batch_particles.x.device, dtype=torch.float32)
+            losses['hyperedge_distribution'] = torch.tensor(0.0, device=batch_particles.x.device, dtype=torch.float32)
         
         # === 3. JET FEATURE LOSS ===
         # Pass topology information for N_constituents prediction
@@ -380,7 +387,7 @@ class BipartiteHyperVAE(nn.Module):
             )
             losses['consistency'] = consistency_loss
         else:
-            losses['consistency'] = torch.tensor(0.0, device=batch_particles.x.device)
+            losses['consistency'] = torch.tensor(0.0, device=batch_particles.x.device, dtype=torch.float32)
         
         # === 5. KL DIVERGENCE ===
         kl_loss = self._kl_divergence(output['mu'], output['logvar'])
@@ -890,7 +897,8 @@ class BipartiteHyperVAE(nn.Module):
             hyperbolic_arg = 1.0 + self.hyperbolic_alpha * euclidean_distances_sq
             # Clamp to avoid numerical issues (arcosh requires x > 1)
             hyperbolic_arg = torch.clamp(hyperbolic_arg, min=1.0 + 1e-8)
-            hyperbolic_distances = torch.acosh(hyperbolic_arg)
+            # Force FP32 for acosh to avoid autocast issues
+            hyperbolic_distances = torch.acosh(hyperbolic_arg.float()).to(hyperbolic_arg.dtype)
             
             if self.use_pt_weighting:
                 # Compute pT-based weights: w_i = (pT_i)^α / Σ (pT_k)^α
@@ -1063,7 +1071,7 @@ class BipartiteHyperVAE(nn.Module):
             cumulative_particles += n_true
         
         # Convert back to tensor
-        return torch.tensor(total_loss / max(valid_count, 1), device=batch.x.device)
+        return torch.tensor(total_loss / max(valid_count, 1), device=batch.x.device, dtype=torch.float32)
     
     def _edge_reconstruction_loss(self, batch, pred_features):
         """
@@ -1079,7 +1087,7 @@ class BipartiteHyperVAE(nn.Module):
         true_features = batch.edge_attr  # [total_edges_in_batch, num_features]
         
         if true_features.size(0) == 0:
-            return torch.tensor(0.0, device=pred_features.device)
+            return torch.tensor(0.0, device=pred_features.device, dtype=torch.float32)
         
         # Get number of features
         num_features = true_features.shape[-1]
@@ -1111,7 +1119,7 @@ class BipartiteHyperVAE(nn.Module):
             loss = 0.5 * mean_loss + 0.3 * std_loss + 0.2 * moment3_loss
             
             if torch.isnan(loss) or torch.isinf(loss):
-                return torch.tensor(0.0, device=pred_features.device)
+                return torch.tensor(0.0, device=pred_features.device, dtype=torch.float32)
             return loss
         else:
             # Evaluation: use Wasserstein distance
@@ -1142,7 +1150,7 @@ class BipartiteHyperVAE(nn.Module):
         true_features = batch.hyperedge_attr  # [total_hyperedges_in_batch, num_features]
         
         if true_features.size(0) == 0:
-            return torch.tensor(0.0, device=pred_features.device)
+            return torch.tensor(0.0, device=pred_features.device, dtype=torch.float32)
         
         # Get number of features
         num_features = true_features.shape[-1]
@@ -1157,7 +1165,7 @@ class BipartiteHyperVAE(nn.Module):
         pred_valid = pred_flat[mask_flat > 0.5]  # [num_valid_predictions, num_features]
         
         if pred_valid.size(0) == 0:
-            return torch.tensor(0.0, device=pred_features.device)
+            return torch.tensor(0.0, device=pred_features.device, dtype=torch.float32)
         
         if self.training or self.evaluation_metric != 'wasserstein':
             # Training: Match distribution moments (mean, std, skewness)
@@ -1185,7 +1193,7 @@ class BipartiteHyperVAE(nn.Module):
             loss = 0.5 * mean_loss + 0.3 * std_loss + 0.2 * moment3_loss
             
             if torch.isnan(loss) or torch.isinf(loss):
-                return torch.tensor(0.0, device=pred_features.device)
+                return torch.tensor(0.0, device=pred_features.device, dtype=torch.float32)
             return loss
         else:
             # Evaluation: use Wasserstein distance (Earth Mover's Distance)
@@ -1219,7 +1227,7 @@ class BipartiteHyperVAE(nn.Module):
         
         # Safety check for NaN/Inf (critical!)
         if torch.isnan(particle_count_loss) or torch.isinf(particle_count_loss):
-            particle_count_loss = torch.tensor(0.0, device=particle_count_loss.device)
+            particle_count_loss = torch.tensor(0.0, device=particle_count_loss.device, dtype=torch.float32)
         
         return particle_count_loss
     
@@ -1325,16 +1333,16 @@ class BipartiteHyperVAE(nn.Module):
         # Check for NaN in individual losses
         if torch.isnan(loss_pt):
             print(f"⚠️  NaN in jet pt loss - pred: {pred_jet_pt[:5]}, true: {true_jet_pt[:5]}")
-            loss_pt = torch.tensor(0.0, device=pred_jet_features.device)
+            loss_pt = torch.tensor(0.0, device=pred_jet_features.device, dtype=torch.float32)
         if torch.isnan(loss_eta):
             print(f"⚠️  NaN in jet eta loss - pred: {pred_jet_eta[:5]}, true: {true_jet_eta[:5]}")
-            loss_eta = torch.tensor(0.0, device=pred_jet_features.device)
+            loss_eta = torch.tensor(0.0, device=pred_jet_features.device, dtype=torch.float32)
         if torch.isnan(loss_mass):
             print(f"⚠️  NaN in jet mass loss - pred: {pred_jet_mass[:5]}, true: {true_jet_mass[:5]}")
-            loss_mass = torch.tensor(0.0, device=pred_jet_features.device)
+            loss_mass = torch.tensor(0.0, device=pred_jet_features.device, dtype=torch.float32)
         
         # Number of constituents loss (only if weight > 0)
-        loss_n_constituents = torch.tensor(0.0, device=pred_jet_features.device)
+        loss_n_constituents = torch.tensor(0.0, device=pred_jet_features.device, dtype=torch.float32)
         if self.jet_n_constituents_weight > 0:
             try:
                 true_n_constituents = batch.n_particles.float()  # [batch_size]
@@ -1343,10 +1351,10 @@ class BipartiteHyperVAE(nn.Module):
                 
                 if torch.isnan(loss_n_constituents):
                     print(f"⚠️  NaN in N_constituents loss")
-                    loss_n_constituents = torch.tensor(0.0, device=pred_jet_features.device)
+                    loss_n_constituents = torch.tensor(0.0, device=pred_jet_features.device, dtype=torch.float32)
             except Exception as e:
                 print(f"⚠️  Error computing N_constituents loss: {e}")
-                loss_n_constituents = torch.tensor(0.0, device=pred_jet_features.device)
+                loss_n_constituents = torch.tensor(0.0, device=pred_jet_features.device, dtype=torch.float32)
         
         # Weighted combination
         jet_loss = (
@@ -1359,7 +1367,7 @@ class BipartiteHyperVAE(nn.Module):
         # Safety check for NaN/Inf
         if torch.isnan(jet_loss) or torch.isinf(jet_loss):
             print("⚠️  Warning: NaN/Inf detected in jet feature loss")
-            jet_loss = torch.tensor(0.0, device=pred_jet_features.device)
+            jet_loss = torch.tensor(0.0, device=pred_jet_features.device, dtype=torch.float32)
         
         return jet_loss
     
@@ -1466,7 +1474,7 @@ class BipartiteHyperVAE(nn.Module):
         
         # Early exit if no valid particles
         if valid_particles.shape[0] == 0:
-            return torch.tensor(0.0, device=device)
+            return torch.tensor(0.0, device=device, dtype=torch.float32)
         
         # Vectorized denormalization (all particles at once)
         # Extract components (vectorized slice)
@@ -1534,10 +1542,11 @@ class BipartiteHyperVAE(nn.Module):
         
         # Invariant mass: m² = E² - p²
         mass_sq = E_sum ** 2 - px_sum ** 2 - py_sum ** 2 - pz_sum ** 2
-        pred_jet_mass = torch.sqrt(torch.clamp(mass_sq, min=0.0) + 1e-8)  # [batch_size]
+        eps = 1e-8 if mass_sq.dtype == torch.float32 else 1e-6
+        pred_jet_mass = torch.sqrt(torch.clamp(mass_sq, min=0.0) + eps)  # [batch_size]
         
-        # Pseudorapidity: η = asinh(pz / pT)
-        pred_jet_eta = torch.asinh(pz_sum / (pred_jet_pt + 1e-8))  # [batch_size]
+        # Pseudorapidity: η = asinh(pz / pT) - force FP32 to avoid autocast issues
+        pred_jet_eta = torch.asinh((pz_sum / torch.clamp(pred_jet_pt, min=eps)).float()).to(pz_sum.dtype)  # [batch_size]
         
         # === VECTORIZED TRUE JET DENORMALIZATION ===
         # Extract normalized true jet features (all jets at once)
@@ -1550,9 +1559,9 @@ class BipartiteHyperVAE(nn.Module):
         true_jet_eta = true_jet_eta_norm * eta_denorm_scale + eta_denorm_offset
         true_jet_logmass = true_jet_mass_norm * mass_denorm_scale + mass_denorm_offset
         
-        # Apply exp to recover physical values from log
-        true_jet_pt = torch.exp(true_jet_logpt)
-        true_jet_mass = torch.exp(true_jet_logmass)
+        # Apply exp to recover physical values from log (force FP32 for stability)
+        true_jet_pt = torch.exp(true_jet_logpt.float()).to(true_jet_logpt.dtype)
+        true_jet_mass = torch.exp(true_jet_logmass.float()).to(true_jet_logmass.dtype)
         
         # === COMPUTE RESIDUAL NORMALIZATION SCALES FROM PHYSICAL VALUES ===
         # For proper normalization, compute std/range from ACTUAL physical distributions
@@ -1573,7 +1582,7 @@ class BipartiteHyperVAE(nn.Module):
         valid_jets_mask = valid_count > 0  # [batch_size]
         
         if not valid_jets_mask.any():
-            return torch.tensor(0.0, device=device)
+            return torch.tensor(0.0, device=device, dtype=torch.float32)
         
         # Compute residuals (only for valid jets using masked operations)
         residual_pt = (pred_jet_pt - true_jet_pt)[valid_jets_mask]
@@ -1712,11 +1721,14 @@ class BipartiteHyperVAE(nn.Module):
         """
         # CRITICAL: Re-clamp mu and logvar to prevent numerical explosion
         # Even though encoder clamps, gradients can push values outside range
-        mu = torch.clamp(mu, min=-10.0, max=10.0)
-        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        # Force FP32 for KL computation (most numerically sensitive operation)
+        mu_fp32 = mu.float()
+        logvar_fp32 = logvar.float()
+        mu_fp32 = torch.clamp(mu_fp32, min=-10.0, max=10.0)
+        logvar_fp32 = torch.clamp(logvar_fp32, min=-10.0, max=10.0)
         
         # KL per dimension: -0.5 * (1 + logvar - mu^2 - exp(logvar))
-        kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        kl_per_dim = -0.5 * (1 + logvar_fp32 - mu_fp32.pow(2) - logvar_fp32.exp())
         
         # Additional safety: clamp KL per dimension to prevent explosion
         # Theoretical max KL per dim with clamped values ≈ 50, so 100 is safe upper bound
@@ -1732,7 +1744,11 @@ class BipartiteHyperVAE(nn.Module):
         
         # Final safety check for NaN/Inf
         if torch.isnan(kl_mean) or torch.isinf(kl_mean):
-            return torch.tensor(0.0, device=mu.device)
+            return torch.tensor(0.0, device=mu.device, dtype=torch.float32)
+        
+        # Convert back to original dtype if needed
+        if mu.dtype != torch.float32:
+            kl_mean = kl_mean.to(mu.dtype)
         
         return kl_mean
     
@@ -1768,10 +1784,21 @@ class BipartiteHyperVAE(nn.Module):
             py = x_norm[..., 2] * py_range + particle_norm_stats['py']['min']
             pz = x_norm[..., 3] * pz_range + particle_norm_stats['pz']['min']
         
-        # Compute pt, eta, phi
-        pt = torch.sqrt(px**2 + py**2 + 1e-12)
-        phi = torch.atan2(py, px)
-        eta = torch.asinh(pz / (pt + 1e-12))
+        # Compute pt, eta, phi with adaptive epsilon for BF16
+        # Force FP32 for trigonometric/hyperbolic operations to avoid autocast issues
+        px_fp32 = px.float()
+        py_fp32 = py.float()
+        pz_fp32 = pz.float()
+        
+        eps = 1e-12
+        pt_fp32 = torch.sqrt(torch.clamp(px_fp32**2 + py_fp32**2, min=eps))
+        phi_fp32 = torch.atan2(py_fp32, px_fp32)
+        eta_fp32 = torch.asinh(pz_fp32 / torch.clamp(pt_fp32, min=eps))
+        
+        # Convert back to original dtype
+        pt = pt_fp32.to(px.dtype)
+        phi = phi_fp32.to(px.dtype)
+        eta = eta_fp32.to(px.dtype)
         
         return E, px, py, pz, pt, eta, phi
 
@@ -1804,9 +1831,10 @@ class BipartiteHyperVAE(nn.Module):
         delta_R = torch.sqrt(delta_eta**2 + delta_phi**2 + 1e-12)
         
         # Compute observables (vectorized)
+        eps = 1e-12 if pt.dtype == torch.float32 else 1e-10
         pt_min = torch.minimum(pt[i_idx], pt[j_idx])
         k_T = pt_min * delta_R
-        z = pt_min / (pt[i_idx] + pt[j_idx] + 1e-12)
+        z = pt_min / (pt[i_idx] + pt[j_idx] + eps)
         
         # Invariant mass squared (using already-computed 4-momenta, no recalculation!)
         E_sum = E[i_idx] + E[j_idx]
@@ -1815,11 +1843,12 @@ class BipartiteHyperVAE(nn.Module):
         pz_sum = pz[i_idx] + pz[j_idx]
         m2 = torch.clamp(E_sum**2 - (px_sum**2 + py_sum**2 + pz_sum**2), min=1e-12)
         
-        # Log-transform (IRC-safe)
-        ln_delta = torch.log(delta_R + 1e-12)
-        ln_kT = torch.log(k_T + 1e-12)
-        ln_z = torch.log(z + 1e-12)
-        ln_m2 = torch.log(m2)
+        # Log-transform (IRC-safe) with adaptive epsilon for BF16
+        eps = 1e-12 if delta_R.dtype == torch.float32 else 1e-10
+        ln_delta = torch.log(torch.clamp(delta_R, min=eps))
+        ln_kT = torch.log(torch.clamp(k_T, min=eps))
+        ln_z = torch.log(torch.clamp(z, min=eps))
+        ln_m2 = torch.log(torch.clamp(m2, min=eps))
         
         # Mask NaN/Inf (single operation)
         valid = torch.isfinite(ln_delta) & torch.isfinite(ln_kT) & torch.isfinite(ln_z) & torch.isfinite(ln_m2)
@@ -1865,7 +1894,7 @@ class BipartiteHyperVAE(nn.Module):
             scalar torch.Tensor (edge + hyperedge distribution loss)
         """
         if not self.use_distribution_loss:
-            return torch.tensor(0.0, device=pred_particles.device)
+            return torch.tensor(0.0, device=pred_particles.device, dtype=torch.float32)
         
         batch_size = batch.num_graphs
         device = pred_particles.device
@@ -1904,7 +1933,7 @@ class BipartiteHyperVAE(nn.Module):
                 gen_particles_list.append(gen_norm)
         
         if len(real_particles_list) == 0 or len(gen_particles_list) == 0:
-            return torch.tensor(0.0, device=device)
+            return torch.tensor(0.0, device=device, dtype=torch.float32)
         
         # ═══════════════════════════════════════════════════════════════════════
         # STEP 2: EXTRACT REAL EDGE FEATURES 
@@ -1965,8 +1994,8 @@ class BipartiteHyperVAE(nn.Module):
                 # Generated values - compute and NORMALIZE to match real
                 if key == '2pt_EEC':
                     # Compute 2-pt EEC for generated particles
-                    # Convert generated pt/eta/phi to numpy for EEC library
-                    gen_pt_eta_phi_numpy = [x.cpu().detach().numpy() for x in gen_pt_eta_phi_list]
+                    # Convert generated pt/eta/phi to numpy for EEC library (BF16 -> FP32 first for numpy compatibility)
+                    gen_pt_eta_phi_numpy = [x.float().cpu().detach().numpy() for x in gen_pt_eta_phi_list]
                     gen_2pt_eec = get_eec_ls_values(gen_pt_eta_phi_numpy, N=2, bins=self.eec_prop[1], 
                                                    axis_range=self.eec_prop[2], print_every=0)
                     gen_eec_hist = np.array(gen_2pt_eec.get_hist_errs(0, False)[0])
@@ -2128,8 +2157,8 @@ class BipartiteHyperVAE(nn.Module):
         
         if not self.use_distribution_loss:
             return {
-                'edge': torch.tensor(0.0, device=pred_particles.device),
-                'hyperedge': torch.tensor(0.0, device=pred_particles.device)
+                'edge': torch.tensor(0.0, device=pred_particles.device, dtype=torch.float32),
+                'hyperedge': torch.tensor(0.0, device=pred_particles.device, dtype=torch.float32)
             }
         
         batch_size = batch.num_graphs
@@ -2171,8 +2200,8 @@ class BipartiteHyperVAE(nn.Module):
         
         if len(real_particles_list) == 0 or len(gen_particles_list) == 0:
             return {
-                'edge': torch.tensor(0.0, device=device),
-                'hyperedge': torch.tensor(0.0, device=device)
+                'edge': torch.tensor(0.0, device=device, dtype=torch.float32),
+                'hyperedge': torch.tensor(0.0, device=device, dtype=torch.float32)
             }
         
         # ═══════════════════════════════════════════════════════════════════════
@@ -2228,7 +2257,8 @@ class BipartiteHyperVAE(nn.Module):
                 # Generated values (need to be normalized)
                 if key == '2pt_EEC':
                     # Compute generated EEC histogram (store for reuse in hyperedge loss)
-                    gen_pt_eta_phi_numpy = [x.cpu().detach().numpy() for x in gen_pt_eta_phi_list]
+                    # BF16 -> FP32 first for numpy compatibility
+                    gen_pt_eta_phi_numpy = [x.float().cpu().detach().numpy() for x in gen_pt_eta_phi_list]
                     gen_2pt_eec = get_eec_ls_values(gen_pt_eta_phi_numpy, N=2, bins=self.eec_prop[1], 
                                                axis_range=self.eec_prop[2], print_every=0)
                     gen_eec_hist = np.array(gen_2pt_eec.get_hist_errs(0, False)[0])
@@ -2332,7 +2362,8 @@ class BipartiteHyperVAE(nn.Module):
                 
                 if key == '2pt_EEC':
                     # Real: scalar values → create histogram
-                    gen_pt_eta_phi_numpy = [x.cpu().detach().numpy() for x in gen_pt_eta_phi_list]
+                    # BF16 -> FP32 first for numpy compatibility
+                    gen_pt_eta_phi_numpy = [x.float().cpu().detach().numpy() for x in gen_pt_eta_phi_list]
                     gen_eec = get_eec_ls_values(gen_pt_eta_phi_numpy, N=2, bins=self.eec_prop[1], 
                                                axis_range=self.eec_prop[2], print_every=0)
                     gen_eec_hist = np.array(gen_eec.get_hist_errs(0, False)[0])
